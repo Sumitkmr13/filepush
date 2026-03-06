@@ -1,0 +1,797 @@
+"""
+Production-ready RAG SOW extractor: Vertex AI (Gemini) + SharePoint + Smart Resume.
+Uses same connection pattern as check_connections.py (SHAREPOINT_DRIVE_ID, _resolve_drive_id, etc.).
+Entry point: run with uvicorn or via Docker.
+"""
+import asyncio
+import logging
+import threading
+from pathlib import Path
+from queue import Empty, Queue
+from typing import Callable, Optional
+
+from dotenv import load_dotenv
+
+load_dotenv()
+# Optional: load SharePoint secrets from GCP Secret Manager into os.environ (before config is read)
+try:
+    from secret_loader import load_secrets_from_gcp
+    load_secrets_from_gcp()
+except Exception:  # noqa: S110
+    pass
+
+import pandas as pd
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse
+
+from config import (
+    DATA_DIR,
+    EXCEL_OUTPUT_DIR,
+    EXCEL_SOW_PATH,
+    EXCEL_INVOICE_PATH,
+    EXTRACTION_MONITOR_INTERVAL_MINUTES,
+    FIELDS,
+    INVOICE_FIELDS,
+    SOW_FIELDS,
+    GCS_OUTPUT_BUCKET,
+)
+from data_utils import clean_amount, clean_date, remove_duplicate_entries
+from state_manager import (
+    classify_item,
+    get_processed_ids,
+    get_processed_meta,
+    mark_processed,
+    should_process_item,
+)
+from sharepoint_utils import (
+    is_sharepoint_configured,
+    list_pdf_items_streaming,
+    download_file_bytes,
+)
+from ai_processor import _normalize_field_value, debug_pdf_bytes, process_pdf_bytes
+
+# Internal key used to carry the SharePoint web URL through the result row dict.
+# Written as a data column "SharePoint URL" in both Excels so Filename hyperlinks
+# can be re-applied when the Excel is reloaded on subsequent runs.
+_URL_KEY = "SharePoint URL"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="SOW RAG Extractor (Vertex AI + SharePoint)")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+EXCEL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Background extraction state (same connection approach as check_connections; Smart Resume = state file)
+_extraction_lock = threading.Lock()
+_extraction_state = {
+    "running": False,
+    "stop_requested": False,
+    "current_file": None,
+    "processed_this_run": 0,
+    "total_to_process": 0,
+    "last_error": None,
+    "total_in_excel": 0,
+}
+
+
+def _monitor_loop() -> None:
+    """Every N minutes, run extraction if not already running (picks up new/changed files on SharePoint)."""
+    import time
+    interval_sec = EXTRACTION_MONITOR_INTERVAL_MINUTES * 60
+    if interval_sec <= 0:
+        return
+    logger.info("SharePoint monitor started: will run extraction every %s min when idle.", EXTRACTION_MONITOR_INTERVAL_MINUTES)
+    while True:
+        time.sleep(interval_sec)
+        with _extraction_lock:
+            if _extraction_state["running"]:
+                continue
+        try:
+            logger.info("Monitor: starting extraction (new/changed files on SharePoint).")
+            _run_extraction(stop_check=None)
+        except Exception as e:
+            logger.exception("Monitor extraction failed: %s", e)
+
+
+def _start_monitor_if_enabled() -> None:
+    if EXTRACTION_MONITOR_INTERVAL_MINUTES <= 0:
+        return
+    t = threading.Thread(target=_monitor_loop, daemon=True)
+    t.start()
+
+
+_DATE_COLS = {"Start Date", "End Date"}
+_AMOUNT_COLS = {"Invoice Value", "Annual Cost", "Commercial Value"}
+
+
+def _load_existing_excel(excel_path: Path, output_fields: list) -> Optional[pd.DataFrame]:
+    """
+    Load an existing Excel into a DataFrame with columns [Filename, SharePoint URL, *output_fields].
+    Returns None if the file doesn't exist or can't be read.
+    Also migrates legacy 'SharePoint Link' column to 'SharePoint URL' transparently.
+    """
+    if not excel_path.exists():
+        return None
+    try:
+        df = pd.read_excel(excel_path)
+        # Migrate old column name
+        if _URL_KEY not in df.columns and "SharePoint Link" in df.columns:
+            df = df.rename(columns={"SharePoint Link": _URL_KEY})
+        for col in ["Filename", _URL_KEY] + output_fields:
+            if col not in df.columns:
+                df[col] = ""
+        keep = ["Filename", _URL_KEY] + output_fields + (["Error"] if "Error" in df.columns else [])
+        return df[[c for c in keep if c in df.columns]].copy()
+    except Exception as e:
+        logger.warning("Could not load %s: %s", excel_path.name, e)
+        return None
+
+
+def _apply_filename_hyperlinks(path: Path) -> None:
+    """
+    Post-process the Excel: read 'SharePoint URL' column, set each Filename cell as a
+    clickable hyperlink, then hide the URL column (set width=0 / very narrow).
+    Filename is styled in blue underline to signal it is clickable.
+    """
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.styles import Font
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        return
+    try:
+        wb = load_workbook(str(path))
+        ws = wb.active
+        if not ws or ws.max_row < 2:
+            return
+        header = [cell.value for cell in ws[1]]
+        try:
+            fn_idx = header.index("Filename") + 1
+            url_idx = header.index(_URL_KEY) + 1
+        except ValueError:
+            return
+        hyperlink_font = Font(color="0563C1", underline="single")
+        for row_num in range(2, ws.max_row + 1):
+            fn_cell = ws.cell(row=row_num, column=fn_idx)
+            url_cell = ws.cell(row=row_num, column=url_idx)
+            url = (str(url_cell.value or "")).strip()
+            if url and (url.startswith("http://") or url.startswith("https://")):
+                fn_cell.hyperlink = url
+                fn_cell.font = hyperlink_font
+        # Make the URL column very narrow (keep data for reload but visually minimal)
+        ws.column_dimensions[get_column_letter(url_idx)].width = 4
+        wb.save(str(path))
+    except Exception as e:
+        logger.warning("Could not apply filename hyperlinks to %s: %s", path.name, e)
+
+
+def _write_excel(
+    excel_path: Path,
+    existing_df: Optional[pd.DataFrame],
+    new_results: list,
+    output_fields: list,
+    gcs_blob_name: Optional[str] = None,
+    upload_to_gcs: bool = True,
+) -> int:
+    """
+    Build cumulative DataFrame (existing + new rows), dedupe, write to *excel_path*.
+    Columns: Filename | SharePoint URL | *output_fields* | Error
+    Filename cells are hyperlinked to SharePoint URL after writing.
+    Optionally uploads the Excel to GCS.  Returns total row count.
+    """
+    logger.info("Saving %s (%s new rows)...", excel_path.name, len(new_results))
+    base_cols = ["Filename", _URL_KEY] + output_fields
+
+    if existing_df is not None and not existing_df.empty:
+        df = existing_df.copy()
+        for c in base_cols:
+            if c not in df.columns:
+                df[c] = ""
+        df = df[[c for c in base_cols + ["Error"] if c in df.columns]].copy()
+    else:
+        df = pd.DataFrame(columns=base_cols)
+
+    if new_results:
+        new_df = pd.DataFrame(new_results)
+        for col in base_cols + ["Error"]:
+            if col not in new_df.columns:
+                new_df[col] = ""
+        new_df = new_df[[c for c in base_cols + ["Error"] if c in new_df.columns]].copy()
+        for col in new_df.columns:
+            if col in _DATE_COLS:
+                new_df[col] = new_df[col].apply(clean_date)
+            elif col in _AMOUNT_COLS:
+                new_df[col] = new_df[col].apply(clean_amount)
+        df = pd.concat([df, new_df], ignore_index=True)
+
+    df = remove_duplicate_entries(df, fields=output_fields)
+    df.to_excel(str(excel_path), index=False)
+    _apply_filename_hyperlinks(excel_path)
+    logger.info("%s saved (%s rows).", excel_path.name, len(df))
+
+    if upload_to_gcs and GCS_OUTPUT_BUCKET:
+        try:
+            from gcs_utils import upload_file_to_bucket
+            blob = gcs_blob_name or excel_path.name
+            gs_url = upload_file_to_bucket(excel_path, GCS_OUTPUT_BUCKET, blob_name=blob)
+            logger.info("%s uploaded to GCS: %s", excel_path.name, gs_url)
+        except Exception as e:
+            logger.exception("GCS upload failed for %s: %s", excel_path.name, e)
+
+    return len(df)
+
+
+def _route_doc_type(doc_type_raw: str) -> str:
+    """Return 'invoice' or 'sow' from a raw Document Type string extracted by the LLM."""
+    v = doc_type_raw.strip().lower()
+    if "invoice" in v or "licen" in v:
+        return "invoice"
+    return "sow"
+
+
+def _run_extraction(stop_check: Optional[Callable[[], bool]] = None, force_reprocess: bool = False):
+    """
+    Stream PDFs from SharePoint (listing in background); process each as soon as it arrives.
+    Routes each result to sow_results.xlsx or invoice_results.xlsx based on detected Document Type.
+    Unless force_reprocess=True: skip already-processed (Smart Resume) and only process new/changed.
+    Saves both Excels periodically and on stop/finish.
+    Returns (new_count, total_sow + total_invoice, [EXCEL_SOW_PATH, EXCEL_INVOICE_PATH]).
+    """
+    if not is_sharepoint_configured():
+        logger.warning("SharePoint not configured; no PDF source")
+        return 0, 0, None
+
+    with _extraction_lock:
+        _extraction_state["current_file"] = "Listing + processing (starting as PDFs are found)..."
+        _extraction_state["total_to_process"] = -1
+
+    logger.info(
+        "Extraction started: listing and processing in parallel (%s). "
+        "Routes each PDF to sow_results.xlsx or invoice_results.xlsx by document type.",
+        "reprocess all (ignoring state)" if force_reprocess else "new + changed files",
+    )
+    processed_ids = get_processed_ids()
+    processed_meta = get_processed_meta()
+    existing_sow_df = _load_existing_excel(EXCEL_SOW_PATH, SOW_FIELDS)
+    existing_inv_df = _load_existing_excel(EXCEL_INVOICE_PATH, INVOICE_FIELDS)
+
+    pdf_queue: "Queue[Optional[tuple]]" = Queue()
+
+    def producer() -> None:
+        try:
+            for item, drive_id in list_pdf_items_streaming():
+                if stop_check and stop_check():
+                    logger.info("Stop requested; stopping PDF listing.")
+                    break
+                pdf_queue.put((item, drive_id))
+        except Exception as e:
+            logger.exception("Listing failed: %s", e)
+        finally:
+            pdf_queue.put(None)
+
+    list_thread = threading.Thread(target=producer, daemon=True)
+    list_thread.start()
+
+    sow_results: list = []
+    invoice_results: list = []
+    processed_this_batch = 0
+    SAVE_EXCEL_EVERY_N = 10  # periodic local saves during long runs (GCS upload at end/stop only)
+
+    def _periodic_save() -> None:
+        _write_excel(EXCEL_SOW_PATH, existing_sow_df, sow_results, SOW_FIELDS, upload_to_gcs=False)
+        _write_excel(EXCEL_INVOICE_PATH, existing_inv_df, invoice_results, INVOICE_FIELDS, upload_to_gcs=False)
+        logger.info(
+            "Periodic save: %s SOW rows, %s Invoice rows (GCS upload at end of run).",
+            len(sow_results), len(invoice_results),
+        )
+
+    def process_one(it: dict, drive_id: str, idx: int) -> None:
+        nonlocal processed_this_batch
+        short_name = it.get("name") or it.get("id")
+        folder_name = it.get("folder", "")
+        with _extraction_lock:
+            _extraction_state["current_file"] = short_name
+            _extraction_state["last_error"] = None
+        logger.info("[%s] Downloading: %s (%s)", idx, short_name, folder_name or "root")
+        try:
+            pdf_bytes = download_file_bytes(it["id"], drive_id=drive_id)
+            size_kb = len(pdf_bytes) / 1024
+            logger.info("[%s] Downloaded %s (%.1f KB). Extracting fields (RAG)...", idx, short_name, size_kb)
+            row = process_pdf_bytes(pdf_bytes, folder_name=folder_name, file_name=short_name)
+            debug_note = row.pop("_debug_note", None)
+            if debug_note:
+                row["Error"] = debug_note
+            # Attach SharePoint URL for hyperlink + data persistence
+            row[_URL_KEY] = it.get("webUrl", "")
+            # Route to correct Excel by detected document type
+            doc_type = (row.get("Document Type") or "").strip()
+            target = _route_doc_type(doc_type)
+            if target == "invoice":
+                invoice_results.append(row)
+                logger.info("[%s] Completed: %s → invoice_results (Type: %s)", idx, short_name, doc_type or "unknown")
+            else:
+                sow_results.append(row)
+                logger.info("[%s] Completed: %s → sow_results (Type: %s)", idx, short_name, doc_type or "unknown→SOW")
+            mark_processed(
+                it["id"],
+                eTag=it.get("eTag"),
+                last_modified=it.get("last_modified"),
+                name=it.get("name"),
+                folder=it.get("folder"),
+                doc_type=target,  # "sow" or "invoice" for easy debug/filtering
+            )
+            processed_this_batch += 1
+            with _extraction_lock:
+                _extraction_state["processed_this_run"] = processed_this_batch
+            if processed_this_batch % SAVE_EXCEL_EVERY_N == 0:
+                _periodic_save()
+        except Exception as e:
+            logger.exception("[%s] FAILED: %s — %s", idx, short_name, e)
+            with _extraction_lock:
+                _extraction_state["last_error"] = str(e)
+            err_row = {
+                "Filename": it.get("name", ""),
+                _URL_KEY: it.get("webUrl", ""),
+                "Error": str(e),
+                **{f: "" for f in FIELDS},
+            }
+            sow_results.append(err_row)  # failed rows land in SOW for visibility
+
+    def _save_and_return(upload: bool = True):
+        sow_total = _write_excel(
+            EXCEL_SOW_PATH, existing_sow_df, sow_results, SOW_FIELDS,
+            gcs_blob_name=EXCEL_SOW_PATH.name, upload_to_gcs=upload,
+        )
+        inv_total = _write_excel(
+            EXCEL_INVOICE_PATH, existing_inv_df, invoice_results, INVOICE_FIELDS,
+            gcs_blob_name=EXCEL_INVOICE_PATH.name, upload_to_gcs=upload,
+        )
+        return sow_total + inv_total
+
+    idx = 0
+    while True:
+        if stop_check and stop_check():
+            logger.info("Stop requested; saving both Excels and uploading to GCS before exiting.")
+            total_count = _save_and_return(upload=True)
+            return len(sow_results) + len(invoice_results), total_count, EXCEL_SOW_PATH
+        x = pdf_queue.get()
+        if x is None:
+            break
+        item, drive_id = x
+        idx += 1
+        if not force_reprocess and not should_process_item(item, processed_ids, processed_meta):
+            continue
+        process_one(item, drive_id, idx)
+
+    while True:
+        try:
+            x = pdf_queue.get_nowait()
+        except Empty:
+            break
+        if x is None:
+            continue
+        item, drive_id = x
+        idx += 1
+        if not force_reprocess and not should_process_item(item, processed_ids, processed_meta):
+            continue
+        process_one(item, drive_id, idx)
+
+    if idx == 0:
+        logger.warning("No PDFs found at path. Check SHAREPOINT_DRIVE_PATH and SHAREPOINT_DRIVE_ID.")
+        with _extraction_lock:
+            _extraction_state["current_file"] = "No PDFs found at path (check SHAREPOINT_DRIVE_PATH / drive)"
+            _extraction_state["total_to_process"] = 0
+        total = (
+            (len(existing_sow_df) if existing_sow_df is not None else 0)
+            + (len(existing_inv_df) if existing_inv_df is not None else 0)
+        )
+        return 0, total, None
+
+    new_total = len(sow_results) + len(invoice_results)
+    logger.info(
+        "Extraction run finished. %s new: %s SOW, %s Invoice. Saving and uploading...",
+        new_total, len(sow_results), len(invoice_results),
+    )
+    total_count = _save_and_return(upload=True)
+    logger.info("Done. Combined rows across both Excels: %s.", total_count)
+    return new_total, total_count, EXCEL_SOW_PATH
+
+
+def _run_extraction_background(force_reprocess: bool = False) -> None:
+    """Run extraction in background; updates _extraction_state. Uses stop_check so stop saves Excel + GCS."""
+    def stop_check() -> bool:
+        with _extraction_lock:
+            return _extraction_state["stop_requested"]
+
+    logger.info("Background extraction job started (force_reprocess=%s).", force_reprocess)
+    try:
+        with _extraction_lock:
+            _extraction_state["processed_this_run"] = 0
+            _extraction_state["last_error"] = None
+        new_count, total_count, output_path = _run_extraction(stop_check=stop_check, force_reprocess=force_reprocess)
+        with _extraction_lock:
+            _extraction_state["total_in_excel"] = total_count
+        logger.info("Background extraction finished successfully. New: %s, total in Excel: %s", new_count, total_count)
+    except Exception as e:
+        logger.exception("Background extraction failed: %s", e)
+        with _extraction_lock:
+            _extraction_state["last_error"] = str(e)
+    finally:
+        with _extraction_lock:
+            _extraction_state["running"] = False
+            _extraction_state["stop_requested"] = False
+            _extraction_state["current_file"] = None
+        logger.info("Extraction job ended. Check /extract-sow/status or /state for summary.")
+
+
+@app.post("/extract-sow/")
+async def extract_sow(force_reprocess: bool = False):
+    """
+    Run extraction synchronously (blocks until done). Uses Smart Resume unless force_reprocess=true.
+    Query: force_reprocess=true to process every file from start (ignore state).
+    For background run: POST /extract-sow/start or POST /extract-sow/reprocess-all.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        new_count, total_count, output_path = await loop.run_in_executor(
+            None, lambda: _run_extraction(stop_check=None, force_reprocess=force_reprocess)
+        )
+    except Exception as e:
+        logger.exception("Extract failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if output_path is None:
+        return {
+            "status": "success",
+            "message": "No PDFs found; no Excel written.",
+            "output_file": None,
+            "new_records": 0,
+            "total_records": 0,
+        }
+
+    return {
+        "status": "success",
+        "output_file": output_path.name,
+        "new_records": new_count,
+        "total_records": total_count,
+    }
+
+
+@app.post("/extract-sow/start")
+async def extract_sow_start():
+    """Start extraction in background. Resumes from state (skips already-processed PDFs). Use GET /extract-sow/status to poll; POST /extract-sow/stop to stop."""
+    with _extraction_lock:
+        if _extraction_state["running"]:
+            return {"status": "already_running", "message": "Extraction is already running."}
+        _extraction_state["running"] = True
+        _extraction_state["stop_requested"] = False
+        _extraction_state["processed_this_run"] = 0
+        _extraction_state["total_to_process"] = 0
+        _extraction_state["current_file"] = None
+        _extraction_state["last_error"] = None
+    thread = threading.Thread(target=_run_extraction_background, kwargs={"force_reprocess": False}, daemon=True)
+    thread.start()
+    return {"status": "started", "message": "Extraction started in background. Use GET /extract-sow/status to poll; POST /extract-sow/stop to stop."}
+
+
+@app.post("/extract-sow/reprocess-all")
+async def extract_sow_reprocess_all():
+    """
+    Start extraction in background and process every PDF from start, ignoring state (already-processed files are reprocessed).
+    Use GET /extract-sow/status to poll; POST /extract-sow/stop to stop.
+    """
+    with _extraction_lock:
+        if _extraction_state["running"]:
+            return {"status": "already_running", "message": "Extraction is already running."}
+        _extraction_state["running"] = True
+        _extraction_state["stop_requested"] = False
+        _extraction_state["processed_this_run"] = 0
+        _extraction_state["total_to_process"] = 0
+        _extraction_state["current_file"] = None
+        _extraction_state["last_error"] = None
+    thread = threading.Thread(target=_run_extraction_background, kwargs={"force_reprocess": True}, daemon=True)
+    thread.start()
+    return {
+        "status": "started",
+        "message": "Reprocess-all started: every PDF will be processed from start (state ignored). Use GET /extract-sow/status to poll; POST /extract-sow/stop to stop.",
+    }
+
+
+@app.get("/extract-sow/status")
+async def extract_sow_status():
+    """Return current extraction status: running, stop_requested, progress (processed, total, current_file), last_error."""
+    with _extraction_lock:
+        s = dict(_extraction_state)
+    # Helpful message when running: show phase (listing vs processing) or why 0 processed
+    phase = "idle"
+    if s["running"]:
+        if s["current_file"] and "Listing" in str(s["current_file"]):
+            phase = "listing"
+        elif s["total_to_process"] and s["total_to_process"] > 0:
+            phase = "processing"
+        else:
+            phase = "starting"
+    return {
+        "running": s["running"],
+        "stop_requested": s["stop_requested"],
+        "phase": phase,
+        "processed_this_run": s["processed_this_run"],
+        "total_to_process": s["total_to_process"],
+        "current_file": s["current_file"],
+        "total_in_excel": s["total_in_excel"],
+        "last_error": s["last_error"],
+    }
+
+
+@app.post("/extract-sow/stop")
+async def extract_sow_stop():
+    """Request extraction to stop after the current PDF. Excel is saved and uploaded to GCS before exit; next run resumes from state."""
+    with _extraction_lock:
+        if not _extraction_state["running"]:
+            return {"status": "not_running", "message": "No extraction is running."}
+        _extraction_state["stop_requested"] = True
+    return {"status": "stop_requested", "message": "Extraction will stop after current PDF. Excel will be saved and uploaded to GCS."}
+
+
+def _run_scan(timeout_seconds: int = 300) -> dict:
+    """List PDFs from SharePoint (streaming) and return new/changed/up_to_date counts. Does not process."""
+    if not is_sharepoint_configured():
+        return {"error": "SharePoint not configured", "new_count": 0, "changed_count": 0, "up_to_date_count": 0, "total": 0}
+    import time
+    processed_ids = get_processed_ids()
+    processed_meta = get_processed_meta()
+    scan_queue: "Queue[Optional[tuple]]" = Queue()
+    def producer() -> None:
+        try:
+            for item, _ in list_pdf_items_streaming():
+                scan_queue.put((item, None))
+        except Exception as e:
+            logger.exception("Scan listing failed: %s", e)
+        finally:
+            scan_queue.put(None)
+    t = threading.Thread(target=producer, daemon=True)
+    t.start()
+    deadline = time.monotonic() + timeout_seconds
+    new_count = changed_count = up_to_date_count = 0
+    while time.monotonic() < deadline:
+        try:
+            x = scan_queue.get(timeout=1)
+        except Empty:
+            continue
+        if x is None:
+            break
+        item, _ = x
+        kind = classify_item(item, processed_ids, processed_meta)
+        if kind == "new":
+            new_count += 1
+        elif kind == "changed":
+            changed_count += 1
+        else:
+            up_to_date_count += 1
+    # Drain remainder if we hit timeout
+    while True:
+        try:
+            x = scan_queue.get_nowait()
+        except Empty:
+            break
+        if x is None:
+            continue
+        item, _ = x
+        kind = classify_item(item, processed_ids, processed_meta)
+        if kind == "new":
+            new_count += 1
+        elif kind == "changed":
+            changed_count += 1
+        else:
+            up_to_date_count += 1
+    total = new_count + changed_count + up_to_date_count
+    return {
+        "new_count": new_count,
+        "changed_count": changed_count,
+        "up_to_date_count": up_to_date_count,
+        "total": total,
+        "to_process": new_count + changed_count,
+        "scan_timed_out": time.monotonic() >= deadline and t.is_alive(),
+    }
+
+
+@app.get("/extract-sow/scan")
+async def extract_sow_scan(timeout: int = 300):
+    """
+    Scan SharePoint for PDFs and return counts: new, changed (modified since last run), up_to_date.
+    Does not process; use POST /extract-sow/start to process new and changed files.
+    Optional query: timeout= seconds to wait for listing (default 300).
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: _run_scan(timeout_seconds=min(timeout, 600)))
+    except Exception as e:
+        logger.exception("Scan failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    return result
+
+
+@app.get("/download/{file_name}")
+async def download_file(file_name: str):
+    """Serve a generated Excel from DATA_DIR by exact filename (e.g. sow_results.xlsx or invoice_results.xlsx)."""
+    path = EXCEL_OUTPUT_DIR / file_name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"File not found: {file_name}")
+    return FileResponse(
+        path,
+        filename=path.name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.get("/download")
+async def download_list():
+    """List available output Excels with download links."""
+    files = []
+    for p in [EXCEL_SOW_PATH, EXCEL_INVOICE_PATH]:
+        if p.exists():
+            files.append({"file": p.name, "url": f"/download/{p.name}"})
+    if not files:
+        raise HTTPException(status_code=404, detail="No output files yet; run /extract-sow first.")
+    return {"available_files": files}
+
+
+@app.get("/state")
+async def get_state():
+    """Return current extraction state (processed count / path) for debugging."""
+    from state_manager import get_state_summary
+    summary = get_state_summary()
+    summary["state_path"] = str(DATA_DIR / "extraction_state.json")
+    return summary
+
+
+@app.get("/state/by-type")
+async def get_state_by_type(doc_type: str = "sow"):
+    """
+    Return list of processed files filtered by doc_type.
+    Query: ?doc_type=sow or ?doc_type=invoice
+    """
+    from state_manager import get_processed_items_by_type
+    items = get_processed_items_by_type(doc_type)
+    return {"doc_type": doc_type, "count": len(items), "items": items}
+
+
+@app.get("/debug/pdf/download")
+async def debug_pdf_download(item_id: str):
+    """
+    Download a specific PDF from SharePoint by its item ID so you can open it locally.
+    Usage: GET /debug/pdf/download?item_id=01JG6ORK...
+    Find item IDs from the Excel (or from /debug/pdf/inspect).
+    """
+    if not is_sharepoint_configured():
+        raise HTTPException(status_code=400, detail="SharePoint not configured")
+    try:
+        loop = asyncio.get_event_loop()
+        pdf_bytes = await loop.run_in_executor(None, lambda: download_file_bytes(item_id))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Download failed: {e}")
+    from fastapi.responses import Response
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={item_id}.pdf"},
+    )
+
+
+@app.get("/debug/pdf/inspect")
+async def debug_pdf_inspect(item_id: str):
+    """
+    Download a PDF from SharePoint and run full debug: extract text, show preview, run RAG, show per-field results.
+    Usage: GET /debug/pdf/inspect?item_id=01JG6ORK...
+    Returns: text_length, text_preview (first 2000 chars), text_empty flag, fields dict, and diagnosis.
+    """
+    if not is_sharepoint_configured():
+        raise HTTPException(status_code=400, detail="SharePoint not configured")
+    try:
+        loop = asyncio.get_event_loop()
+        pdf_bytes = await loop.run_in_executor(None, lambda: download_file_bytes(item_id))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Download failed: {e}")
+    try:
+        result = await loop.run_in_executor(None, lambda: debug_pdf_bytes(pdf_bytes, file_name=item_id))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Debug failed: {e}")
+    return result
+
+
+@app.get("/debug/pdf/list-problems")
+async def debug_pdf_list_problems():
+    """
+    Read both output Excels and list rows with missing/empty fields or errors.
+    Helps identify which PDFs need investigation.
+    """
+    results = {}
+    for label, excel_path, check_fields in [
+        ("sow", EXCEL_SOW_PATH, SOW_FIELDS),
+        ("invoice", EXCEL_INVOICE_PATH, INVOICE_FIELDS),
+    ]:
+        if not excel_path.exists():
+            results[label] = {"file": excel_path.name, "total_rows": 0, "problem_count": 0, "problems": []}
+            continue
+        try:
+            df = pd.read_excel(excel_path)
+        except Exception as e:
+            results[label] = {"file": excel_path.name, "error": str(e)}
+            continue
+        problems = []
+        for _, row in df.iterrows():
+            missing = [f for f in check_fields if not _normalize_field_value(str(row.get(f, "")))]
+            has_error = bool(str(row.get("Error", "")).strip())
+            if missing or has_error:
+                problems.append({
+                    "Filename": row.get("Filename", ""),
+                    "SharePoint URL": row.get(_URL_KEY, ""),
+                    "missing_fields": missing,
+                    "error": str(row.get("Error", "")).strip() or None,
+                })
+        results[label] = {
+            "file": excel_path.name,
+            "total_rows": len(df),
+            "problem_count": len(problems),
+            "problems": problems,
+        }
+    return results
+
+
+@app.get("/", response_class=HTMLResponse)
+async def read_index():
+    """Serve simple landing page."""
+    return HTMLResponse(content="""
+<h1>Contract &amp; Invoice RAG Extractor</h1>
+<p>Each processed PDF is classified as a <b>SOW Document</b> or <b>License Invoice</b> and written to the matching Excel.
+Filenames in the Excel are clickable hyperlinks back to SharePoint.</p>
+<h3>Extraction</h3>
+<ul>
+  <li><b>POST /extract-sow/start</b> — start in background (Smart Resume: skips already-processed files)</li>
+  <li><b>GET /extract-sow/status</b> — poll progress</li>
+  <li><b>POST /extract-sow/stop</b> — stop after current PDF; both Excels are saved + uploaded to GCS</li>
+  <li><b>POST /extract-sow/reprocess-all</b> — reprocess every PDF from scratch (ignore state)</li>
+  <li><b>POST /extract-sow/</b> — run synchronously (add ?force_reprocess=true to reprocess all)</li>
+</ul>
+<h3>Scan (no processing)</h3>
+<ul>
+  <li><b>GET /extract-sow/scan</b> — count new/changed PDFs without processing</li>
+</ul>
+<h3>Download</h3>
+<ul>
+  <li><b>GET /download</b> — list available output files</li>
+  <li><b>GET /download/sow_results.xlsx</b> — SOW Document Excel</li>
+  <li><b>GET /download/invoice_results.xlsx</b> — License Invoice Excel</li>
+</ul>
+<h3>State &amp; Debug</h3>
+<ul>
+  <li><b>GET /state</b> — summary with counts by doc_type (sow/invoice)</li>
+  <li><b>GET /state/by-type?doc_type=sow</b> — list processed files classified as SOW</li>
+  <li><b>GET /state/by-type?doc_type=invoice</b> — list processed files classified as Invoice</li>
+  <li><b>GET /debug/pdf/list-problems</b> — rows with missing fields in both Excels</li>
+  <li><b>GET /debug/pdf/inspect?item_id=...</b> — extract text + fields for one PDF</li>
+  <li><b>GET /debug/pdf/download?item_id=...</b> — download a specific PDF to your device</li>
+</ul>
+""")
+
+
+_start_monitor_if_enabled()
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        import pytest
+        sys.exit(pytest.main(["-v", "tests/test_main.py"]))
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
