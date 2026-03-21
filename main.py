@@ -111,7 +111,7 @@ def _start_monitor_if_enabled() -> None:
 
 
 _DATE_COLS = {"Start Date", "End Date"}
-_AMOUNT_COLS = {"Invoice Value", "Annual Cost", "Commercial Value"}
+_AMOUNT_COLS = {"Commercial Value", "TCV"}
 
 
 def _load_existing_excel(excel_path: Path, output_fields: list) -> Optional[pd.DataFrame]:
@@ -329,6 +329,7 @@ def _run_extraction(stop_check: Optional[Callable[[], bool]] = None, force_repro
                 name=it.get("name"),
                 folder=it.get("folder"),
                 doc_type=target,  # "sow" or "invoice" for easy debug/filtering
+                original_language=(row.get("Original Language") or "").strip() or None,
             )
             processed_this_batch += 1
             with _extraction_lock:

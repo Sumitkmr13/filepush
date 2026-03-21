@@ -29,36 +29,51 @@ EXCEL_OUTPUT_PATH = EXCEL_SOW_PATH
 # Full extraction field list sent to the LLM for every PDF.
 # "Document Type" is used to route each row to the correct Excel; it is not shown as a column.
 FIELDS = [
-    "Document Type",        # License Invoice | SOW Document  — used for routing, not shown in Excel
-    "Contract Name",        # SOW: contract/agreement title; License: product/vendor name
-    "Licences Acquired",    # License Invoice: SKU / product description
-    "Quantity",             # License Invoice: number of units
-    "Unit",                 # License Invoice: user / transaction / processor / storage / etc.
-    "Invoice Value",        # License Invoice: total cost of the licence(s)
-    "Annual Cost",          # License Invoice: derived from invoice value ÷ date range
-    "Start Date",           # Both: start of licence/contract period
-    "End Date",             # Both: end of licence/contract period
-    "Commercial Value",     # SOW: total contract value
-    "Owner/Contact",        # SOW: responsible person / primary contact
+    "Document Type",        # License Invoice | SOW Document — routing, not shown in Excel
+    "Original Language",    # From OCR tag; not written to invoice Excel columns
+    # SOW Document fields
+    "Contract Name",
+    "Commercial Value",
+    "Owner/Contact",
+    # License Invoice fields (invoice_results.xlsx)
+    "Contract ID",
+    "Vendor",
+    "Customer",
+    "Contract Type",
+    "Billing Frequency",
+    "Products / Modules",
+    "Currency",
+    "TCV",
+    "Pricing Model",
+    "Licenses Purchased",
+    # Shared
+    "Start Date",
+    "End Date",
 ]
 
 # Columns written to sow_results.xlsx  (excludes Document Type; Filename is always first)
 SOW_FIELDS = [
+    "Original Language",
     "Contract Name",
     "Start Date",
     "End Date",
     "Commercial Value",
+    "Currency",        # currency for Commercial Value
     "Owner/Contact",
 ]
 
-# Columns written to invoice_results.xlsx  (excludes Document Type; Filename is always first)
+# Columns written to invoice_results.xlsx (Filename + SharePoint URL added by main.py)
 INVOICE_FIELDS = [
-    "Contract Name",
-    "Licences Acquired",
-    "Quantity",
-    "Unit",
-    "Invoice Value",
-    "Annual Cost",
+    "Contract ID",
+    "Vendor",
+    "Customer",
+    "Contract Type",
+    "Billing Frequency",
+    "Products / Modules",
+    "Currency",
+    "TCV",
+    "Pricing Model",
+    "Licenses Purchased",
     "Start Date",
     "End Date",
 ]
