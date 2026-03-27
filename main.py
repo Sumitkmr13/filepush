@@ -307,29 +307,34 @@ def _run_extraction(stop_check: Optional[Callable[[], bool]] = None, force_repro
             pdf_bytes = download_file_bytes(it["id"], drive_id=drive_id)
             size_kb = len(pdf_bytes) / 1024
             logger.info("[%s] Downloaded %s (%.1f KB). Extracting fields (RAG)...", idx, short_name, size_kb)
-            row = process_pdf_bytes(pdf_bytes, folder_name=folder_name, file_name=short_name)
-            debug_note = row.pop("_debug_note", None)
-            if debug_note:
-                row["Error"] = debug_note
-            # Attach SharePoint URL for hyperlink + data persistence
-            row[_URL_KEY] = it.get("webUrl", "")
-            # Route to correct Excel by detected document type
-            doc_type = (row.get("Document Type") or "").strip()
+            rows = process_pdf_bytes(pdf_bytes, folder_name=folder_name, file_name=short_name)
+            # process_pdf_bytes now returns a list of row dicts (multi-row for multi-table invoices)
+            first_row = rows[0] if rows else {}
+            doc_type = (first_row.get("Document Type") or "").strip()
             target = _route_doc_type(doc_type)
-            if target == "invoice":
-                invoice_results.append(row)
-                logger.info("[%s] Completed: %s → invoice_results (Type: %s)", idx, short_name, doc_type or "unknown")
-            else:
-                sow_results.append(row)
-                logger.info("[%s] Completed: %s → sow_results (Type: %s)", idx, short_name, doc_type or "unknown→SOW")
+            for row in rows:
+                debug_note = row.pop("_debug_note", None)
+                if debug_note:
+                    row["Error"] = debug_note
+                row[_URL_KEY] = it.get("webUrl", "")
+                if target == "invoice":
+                    invoice_results.append(row)
+                else:
+                    sow_results.append(row)
+            row_count = len(rows)
+            logger.info(
+                "[%s] Completed: %s → %s (%s row%s, Type: %s)",
+                idx, short_name, "invoice_results" if target == "invoice" else "sow_results",
+                row_count, "" if row_count == 1 else "s", doc_type or "unknown",
+            )
             mark_processed(
                 it["id"],
                 eTag=it.get("eTag"),
                 last_modified=it.get("last_modified"),
                 name=it.get("name"),
                 folder=it.get("folder"),
-                doc_type=target,  # "sow" or "invoice" for easy debug/filtering
-                original_language=(row.get("Original Language") or "").strip() or None,
+                doc_type=target,
+                original_language=(first_row.get("Original Language") or "").strip() or None,
             )
             processed_this_batch += 1
             with _extraction_lock:
@@ -346,7 +351,7 @@ def _run_extraction(stop_check: Optional[Callable[[], bool]] = None, force_repro
                 "Error": str(e),
                 **{f: "" for f in FIELDS},
             }
-            sow_results.append(err_row)  # failed rows land in SOW for visibility
+            sow_results.append(err_row)
 
     def _save_and_return(upload: bool = True):
         sow_total = _write_excel(

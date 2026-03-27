@@ -14,6 +14,8 @@ from llama_index.llms.google_genai import GoogleGenAI
 
 from config import (
     FIELDS,
+    INVOICE_LINE_FIELDS,
+    INVOICE_PARENT_FIELDS,
     GCP_PROJECT,
     GCP_LOCATION,
     VERTEX_MODEL,
@@ -196,6 +198,51 @@ def _tight_products_modules(raw: str) -> str:
         lines = [v]
     joined = "; ".join(lines[:20])
     return joined[:2000]
+
+
+def _tight_licenses_purchased(raw: str) -> str:
+    """
+    Extract a compact license-purchase unit summary (e.g. "10 Users", "16 Seats", "15 Seats (WebInsight)").
+    Avoid returning doc type / unrelated paragraph text.
+    """
+    v = (raw or "").strip()
+    if not v:
+        return ""
+    lines = [ln.strip() for ln in v.splitlines() if ln.strip()]
+    unit_words = (
+        "user", "users", "seat", "seats", "license", "licenses",
+        "licence", "licences", "subscription", "subscriptions",
+        "device", "devices", "processor", "processors", "core", "cores",
+        "pc", "pcs",
+    )
+    bad_markers = ("invoice", "sow document", "license invoice", "contract id", "vendor", "customer")
+
+    # 1) Prefer lines with number + unit (strong signal).
+    for ln in lines:
+        low = ln.lower()
+        if any(b in low for b in bad_markers):
+            continue
+        if any(re.search(rf"\b{re.escape(u)}\b", low) for u in unit_words):
+            if re.search(r"\d", ln):
+                return ln[:200].strip()
+
+    # 2) Then any line that contains unit words.
+    for ln in lines:
+        low = ln.lower()
+        if any(b in low for b in bad_markers):
+            continue
+        if any(re.search(rf"\b{re.escape(u)}\b", low) for u in unit_words):
+            return ln[:200].strip()
+
+    # 3) Last resort: first non-junk single line.
+    for ln in lines:
+        low = ln.lower()
+        if any(b in low for b in bad_markers):
+            continue
+        cleaned = re.sub(r"^[\-\*\u2022\d\.\)\s]+", "", ln).strip()
+        if cleaned:
+            return cleaned[:200]
+    return ""
 
 
 # Lazy-init LLM and embedding (Vertex via GOOGLE_APPLICATION_CREDENTIALS)
@@ -435,9 +482,10 @@ _FIELD_PROMPTS: Dict[str, str] = {
         "For SOW Documents leave empty. One short phrase, one line."
     ),
     "Licenses Purchased": (
-        "For License Invoices only: summarize what was purchased in licence terms "
+        "For License Invoices only: extract license units purchased as quantity + unit "
         "(e.g. '10 Users (WebInsight)', '16 Seats', '15 Seats'). "
-        "If not stated, leave empty. Do not paste unrelated contract text. One line if possible."
+        "Return ONLY the license purchase line (units), not document type, vendor, customer, or other fields. "
+        "If not stated, leave empty. One line."
     ),
     "Start Date": (
         "Extract the contract or licence start date. Respond with the date in its original format, one line."
@@ -498,6 +546,8 @@ def extract_fields_from_index(
                 result[field] = _tight_tcv(raw)
             elif field == "Products / Modules":
                 result[field] = _tight_products_modules(raw)
+            elif field == "Licenses Purchased":
+                result[field] = _tight_licenses_purchased(raw)
             else:
                 result[field] = _normalize_field_value(raw)
         except Exception as e:
@@ -509,21 +559,97 @@ def extract_fields_from_index(
     return result
 
 
+_LINE_ITEMS_PROMPT = """You are a financial analyst reviewing this document.
+The document may contain one or more distinct pricing tables, each with its own set of products/modules, total cost, pricing model, and licence units.
+
+For EACH separate pricing table or line-item group in the document, output a JSON object on its own line with exactly these keys:
+  "products_modules": (comma-separated product/module names covered by this table)
+  "tcv": (total cost for this table entry, e.g. "$97,000" or "167,000")
+  "pricing_model": (e.g. "Fixed", "Hybrid (Fixed + User)")
+  "licenses_purchased": (units purchased, e.g. "10 Users (WebInsight)", "16 Seats")
+
+Output ONLY the JSON lines, one per table. No extra text, no markdown fencing.
+If there is only one table, output one JSON line. If there are two separate tables with different costs, output two JSON lines.
+Example output for a document with two tables:
+{"products_modules": "ADM EHSAP Software, Global Data Feeds", "tcv": "$97,000", "pricing_model": "Fixed", "licenses_purchased": ""}
+{"products_modules": "Ariel WebInsight Modules", "tcv": "$33,600", "pricing_model": "Fixed", "licenses_purchased": "10 Users"}
+"""
+
+
+def _extract_invoice_line_items(
+    query_engine: Any,
+    parent_row: Dict[str, str],
+    file_name: str,
+) -> List[Dict[str, str]]:
+    """
+    Query for multiple pricing tables/line-items in an invoice document.
+    Returns a list of row dicts (parent fields repeated on each).
+    Falls back to a single row with the existing parent_row data if parsing fails.
+    """
+    try:
+        response = query_engine.query(f"{_SYSTEM_CONTEXT}\n\n{_LINE_ITEMS_PROMPT}")
+        raw = (response.response or "").strip()
+        logger.info("  [line-items] %s raw response: %s", file_name, raw[:500] if len(raw) > 500 else raw)
+    except Exception as e:
+        logger.warning("  [line-items] %s query failed: %s — falling back to single row", file_name, e)
+        return [parent_row]
+
+    import json as _json
+    items: List[Dict[str, str]] = []
+    # Strip markdown code fences if model added them
+    cleaned = re.sub(r"^```\w*\n?", "", raw, flags=re.MULTILINE)
+    cleaned = re.sub(r"\n?```$", "", cleaned, flags=re.MULTILINE).strip()
+    for line in cleaned.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            obj = _json.loads(line)
+            items.append(obj)
+        except _json.JSONDecodeError:
+            # Try to extract a partial JSON object
+            m = re.search(r"\{.*\}", line)
+            if m:
+                try:
+                    obj = _json.loads(m.group(0))
+                    items.append(obj)
+                except _json.JSONDecodeError:
+                    pass
+
+    if not items:
+        logger.info("  [line-items] %s: no structured items found, using single-row fallback", file_name)
+        return [parent_row]
+
+    logger.info("  [line-items] %s: found %s line-item(s)", file_name, len(items))
+
+    rows: List[Dict[str, str]] = []
+    for item in items:
+        row = dict(parent_row)
+        row["Products / Modules"] = _tight_products_modules(item.get("products_modules", ""))
+        row["TCV"] = _tight_tcv(item.get("tcv", ""))
+        row["Pricing Model"] = _tight_one_line(item.get("pricing_model", ""), "Pricing Model")
+        row["Licenses Purchased"] = _tight_licenses_purchased(item.get("licenses_purchased", ""))
+        rows.append(row)
+    return rows
+
+
 def process_pdf_bytes(
     pdf_bytes: bytes,
     folder_name: str,
     file_name: str,
-) -> Dict[str, str]:
+) -> List[Dict[str, str]]:
     """
     Full pipeline: 50 MB safety check -> Gemini native OCR (PDF bytes) -> in-memory index -> extract FIELDS.
-    Returns one row dict (Folder, Filename, ...FIELDS). Skips files over 50 MB with _debug_note.
+    Returns a **list** of row dicts.
+    For invoice documents with multiple pricing tables, returns one row per table (parent data repeated).
+    For SOW documents or single-table invoices, returns a list with one row.
     """
     if len(pdf_bytes) > MAX_PDF_SIZE_BYTES:
         size_mb = len(pdf_bytes) / (1024 * 1024)
         logger.error("Skipping %s: PDF too large (%.1f MB > 50 MB limit).", file_name, size_mb)
         result = {"Folder": folder_name, "Filename": file_name, **_dict_from_fields("")}
         result["_debug_note"] = f"PDF too large ({size_mb:.1f} MB > 50 MB). Skipped."
-        return result
+        return [result]
 
     text, detected_language = pdf_bytes_to_text(pdf_bytes, file_name=file_name)
     logger.info("  [text] %s: %s chars from Gemini OCR, detected language: %s", file_name, len(text), detected_language or "(none)")
@@ -532,14 +658,31 @@ def process_pdf_bytes(
         logger.warning("  [text] %s: Gemini OCR returned EMPTY — %s", file_name, reason)
         result = {"Folder": folder_name, "Filename": file_name, **_dict_from_fields("")}
         result["_debug_note"] = reason
-        return result
+        return [result]
 
     index = build_index_from_text(text)
     row = extract_fields_from_index(index, folder_name, file_name, original_language_from_ocr=detected_language or None)
     empty_fields = [f for f in FIELDS if not _normalize_field_value(str(row.get(f) or ""))]
     if empty_fields:
         logger.warning("  [fields] %s: empty response for: %s", file_name, ", ".join(empty_fields))
-    return row
+
+    doc_type = (row.get("Document Type") or "").strip().lower()
+    is_invoice = "invoice" in doc_type or "licen" in doc_type
+
+    if is_invoice:
+        llm = _get_llm()
+        response_synthesizer = get_response_synthesizer(llm=llm)
+        qe = index.as_query_engine(
+            llm=llm,
+            response_synthesizer=response_synthesizer,
+            similarity_top_k=10,
+            response_mode="compact",
+        )
+        rows = _extract_invoice_line_items(qe, row, file_name)
+        logger.info("  [result] %s: %s row(s) for invoice", file_name, len(rows))
+        return rows
+
+    return [row]
 
 
 def _dict_from_fields(value: str) -> Dict[str, str]:

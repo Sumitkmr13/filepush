@@ -15,10 +15,10 @@ EXTRACTION_STATE_PATH = DATA_DIR / "extraction_state.json"
 EXCEL_OUTPUT_DIR = DATA_DIR
 
 # Two separate cumulative Excels — one per document type
-EXCEL_SOW_FILENAME = "sow_results.xlsx"
+EXCEL_SOW_FILENAME = "contract_metrics.xlsx"
 EXCEL_SOW_PATH = DATA_DIR / EXCEL_SOW_FILENAME
 
-EXCEL_INVOICE_FILENAME = "invoice_results.xlsx"
+EXCEL_INVOICE_FILENAME = "license_metrics.xlsx"
 EXCEL_INVOICE_PATH = DATA_DIR / EXCEL_INVOICE_FILENAME
 
 # Backward-compat alias (used by older imports / GCS upload key)
@@ -63,20 +63,27 @@ SOW_FIELDS = [
 ]
 
 # Columns written to invoice_results.xlsx (Filename + SharePoint URL added by main.py)
-INVOICE_FIELDS = [
+# Parent fields are constant for the whole document; line-item fields vary per table/entry.
+INVOICE_PARENT_FIELDS = [
     "Contract ID",
     "Vendor",
     "Customer",
     "Contract Type",
     "Billing Frequency",
-    "Products / Modules",
     "Currency",
-    "TCV",
-    "Pricing Model",
-    "Licenses Purchased",
     "Start Date",
     "End Date",
 ]
+
+INVOICE_LINE_FIELDS = [
+    "Products / Modules",
+    "TCV",
+    "Pricing Model",
+    "Licenses Purchased",
+]
+
+# Full ordered column list for the Excel
+INVOICE_FIELDS = INVOICE_PARENT_FIELDS + INVOICE_LINE_FIELDS
 
 
 def _get_gcp_project_from_credentials() -> str:
