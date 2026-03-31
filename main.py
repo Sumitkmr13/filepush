@@ -756,138 +756,334 @@ async def debug_pdf_list_problems():
 
 @app.get("/", response_class=HTMLResponse)
 async def read_index():
-    """Serve static UI page for extraction controls and downloads."""
+    """Serve production-style dashboard UI."""
     return HTMLResponse(content="""
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Contract & Invoice Extractor</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 24px; max-width: 980px; }
-    h1 { margin-bottom: 8px; }
-    .muted { color: #555; }
-    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin: 14px 0; }
-    button { margin-right: 8px; margin-top: 8px; padding: 8px 12px; cursor: pointer; }
-    .ok { color: #0a7d2e; }
-    .err { color: #b00020; }
-    pre { background: #f7f7f7; border: 1px solid #e8e8e8; border-radius: 6px; padding: 10px; overflow-x: auto; }
-    a { text-decoration: none; }
-    a:hover { text-decoration: underline; }
-  </style>
+  <title>SOW & Invoice Extraction Intelligence</title>
+  <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body>
-  <h1>Contract & Invoice Extractor</h1>
-  <p class="muted">Start/stop extraction jobs and download one or both generated Excel files.</p>
+<body class="bg-slate-50 text-slate-900">
+  <div class="max-w-7xl mx-auto px-4 py-6">
+    <header class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+      <div>
+        <h1 class="text-2xl md:text-3xl font-bold">SOW &amp; Invoice Extraction Intelligence</h1>
+        <p class="text-sm text-slate-600 mt-1">Production dashboard for SharePoint document processing.</p>
+      </div>
+      <div id="systemBadge" class="inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm font-medium bg-emerald-100 text-emerald-700">
+        <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
+        System Online
+      </div>
+    </header>
 
-  <div class="card">
-    <h3>Extraction Controls</h3>
-    <button onclick="startJob()">Start (Smart Resume)</button>
-    <button onclick="stopJob()">Stop</button>
-    <button onclick="reprocessAll()">Reprocess All</button>
-    <button onclick="scanOnly()">Scan Only</button>
-    <button onclick="refreshStatus()">Refresh Status</button>
-    <div id="actionMsg" class="muted" style="margin-top:10px;"></div>
+    <section class="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <div class="lg:col-span-2 rounded-xl bg-white border border-slate-200 p-4 shadow-sm">
+        <h2 class="text-lg font-semibold mb-3">Control Center</h2>
+        <div class="flex flex-wrap items-center gap-2">
+          <button id="toggleBtn" onclick="toggleStartStop()" class="px-4 py-2 rounded-md text-white bg-emerald-600 hover:bg-emerald-700">
+            Start Extraction
+          </button>
+          <button onclick="processNow()" class="px-4 py-2 rounded-md text-white bg-indigo-600 hover:bg-indigo-700">
+            Process New Files Now
+          </button>
+          <label class="inline-flex items-center gap-2 text-sm text-slate-700">
+            <input id="forceReprocess" type="checkbox" class="rounded border-slate-300" />
+            Force reprocess
+          </label>
+          <button onclick="runScan()" class="px-3 py-2 rounded-md border border-slate-300 hover:bg-slate-100 text-sm">
+            Scan
+          </button>
+          <button onclick="refreshAll()" class="px-3 py-2 rounded-md border border-slate-300 hover:bg-slate-100 text-sm">
+            Refresh
+          </button>
+        </div>
+        <div id="scanResult" class="text-sm text-slate-600 mt-3"></div>
+      </div>
+
+      <div class="rounded-xl bg-white border border-slate-200 p-4 shadow-sm">
+        <h2 class="text-lg font-semibold mb-3">Download Center</h2>
+        <div class="space-y-2">
+          <a class="block w-full text-center px-3 py-2 rounded-md bg-slate-900 text-white hover:bg-slate-700" href="/download/license_metrics.xlsx">Download license_metrics.xlsx</a>
+          <a class="block w-full text-center px-3 py-2 rounded-md bg-slate-900 text-white hover:bg-slate-700" href="/download/contract_metrics.xlsx">Download contract_metrics.xlsx</a>
+        </div>
+        <div id="downloadStatus" class="text-xs text-slate-500 mt-3"></div>
+      </div>
+    </section>
+
+    <section class="mt-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+      <div class="rounded-xl bg-white border border-slate-200 p-4 shadow-sm">
+        <div class="text-sm text-slate-500">Total Files Processed</div>
+        <div id="statTotal" class="text-2xl font-bold mt-1">0</div>
+      </div>
+      <div class="rounded-xl bg-white border border-slate-200 p-4 shadow-sm">
+        <div class="text-sm text-slate-500">SOWs Identified</div>
+        <div id="statSow" class="text-2xl font-bold mt-1">0</div>
+      </div>
+      <div class="rounded-xl bg-white border border-slate-200 p-4 shadow-sm">
+        <div class="text-sm text-slate-500">Invoices Identified</div>
+        <div id="statInv" class="text-2xl font-bold mt-1">0</div>
+      </div>
+      <div class="rounded-xl bg-white border border-slate-200 p-4 shadow-sm">
+        <div class="text-sm text-slate-500">Errors / Problems</div>
+        <div id="statErr" class="text-2xl font-bold mt-1">0</div>
+      </div>
+    </section>
+
+    <section class="mt-4 grid grid-cols-1 xl:grid-cols-2 gap-4">
+      <div class="rounded-xl bg-white border border-slate-200 p-4 shadow-sm">
+        <h2 class="text-lg font-semibold mb-2">Activity Log</h2>
+        <div id="activityLog" class="h-72 overflow-auto rounded-md bg-slate-950 text-slate-100 text-xs p-3 font-mono">
+          <div class="text-slate-400">Waiting for activity...</div>
+        </div>
+      </div>
+
+      <div class="rounded-xl bg-white border border-slate-200 p-4 shadow-sm">
+        <h2 class="text-lg font-semibold mb-2">Live Processing Status</h2>
+        <pre id="statusBox" class="h-72 overflow-auto rounded-md bg-slate-100 p-3 text-xs text-slate-800">Loading...</pre>
+      </div>
+    </section>
+
+    <section class="mt-4 rounded-xl bg-white border border-slate-200 p-4 shadow-sm">
+      <h2 class="text-lg font-semibold mb-3">Problem List</h2>
+      <div class="overflow-auto">
+        <table class="min-w-full text-sm">
+          <thead>
+            <tr class="text-left border-b">
+              <th class="py-2 pr-3">Type</th>
+              <th class="py-2 pr-3">Filename</th>
+              <th class="py-2 pr-3">Missing Fields</th>
+              <th class="py-2 pr-3">Error</th>
+            </tr>
+          </thead>
+          <tbody id="problemTableBody"></tbody>
+        </table>
+      </div>
+    </section>
   </div>
 
-  <div class="card">
-    <h3>Live Status</h3>
-    <pre id="statusBox">Loading...</pre>
-  </div>
+  <div id="toastHost" class="fixed right-4 top-4 z-50 space-y-2"></div>
 
-  <div class="card">
-    <h3>Downloads</h3>
-    <div id="downloadLinks" class="muted">Loading available files...</div>
-    <button onclick="refreshDownloads()">Refresh Downloads</button>
+  <div class="hidden">
+    <input id="apiBase" value="" />
   </div>
 
   <script>
-    async function apiCall(url, method) {
-      const res = await fetch(url, { method: method || "GET" });
+    const uiState = {
+      lastActivityKey: "",
+      logLines: [],
+    };
+
+    function buildUrl(path) {
+      const base = (document.getElementById("apiBase").value || "").trim();
+      if (!base) return path;
+      return base.replace(/\\/$/, "") + path;
+    }
+
+    function showToast(msg, type) {
+      const host = document.getElementById("toastHost");
+      const el = document.createElement("div");
+      const color = type === "error" ? "bg-rose-600" : "bg-emerald-600";
+      el.className = `${color} text-white px-4 py-2 rounded-md shadow`;
+      el.textContent = msg;
+      host.appendChild(el);
+      setTimeout(() => el.remove(), 4500);
+    }
+
+    async function apiCall(path, method, body) {
+      let res;
+      try {
+        res = await fetch(buildUrl(path), {
+          method: method || "GET",
+          headers: body ? { "Content-Type": "application/json" } : undefined,
+          body: body ? JSON.stringify(body) : undefined,
+          mode: "cors",
+        });
+      } catch (e) {
+        showToast("Network/CORS error. Check backend URL and CORS settings.", "error");
+        throw e;
+      }
       const text = await res.text();
       let payload = text;
       try { payload = JSON.parse(text); } catch (e) {}
       if (!res.ok) {
-        throw new Error(typeof payload === "string" ? payload : JSON.stringify(payload));
+        throw new Error(typeof payload === "string" ? payload : JSON.stringify(payload, null, 2));
       }
       return payload;
     }
 
-    function setMsg(msg, isErr) {
-      const el = document.getElementById("actionMsg");
-      el.className = isErr ? "err" : "ok";
-      el.textContent = msg;
+    function setSystemBadge(running) {
+      const badge = document.getElementById("systemBadge");
+      if (running) {
+        badge.className = "inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm font-medium bg-amber-100 text-amber-700";
+        badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-amber-500 animate-pulse"></span>Processing...';
+      } else {
+        badge.className = "inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm font-medium bg-emerald-100 text-emerald-700";
+        badge.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-500"></span>System Online';
+      }
+    }
+
+    function setToggleButton(running) {
+      const btn = document.getElementById("toggleBtn");
+      if (running) {
+        btn.textContent = "Stop Extraction";
+        btn.className = "px-4 py-2 rounded-md text-white bg-rose-600 hover:bg-rose-700";
+      } else {
+        btn.textContent = "Start Extraction";
+        btn.className = "px-4 py-2 rounded-md text-white bg-emerald-600 hover:bg-emerald-700";
+      }
+    }
+
+    function appendActivity(line) {
+      uiState.logLines.push(line);
+      if (uiState.logLines.length > 120) uiState.logLines = uiState.logLines.slice(-120);
+      const box = document.getElementById("activityLog");
+      box.innerHTML = uiState.logLines.map(x => `<div>${x}</div>`).join("");
+      box.scrollTop = box.scrollHeight;
     }
 
     async function refreshStatus() {
       try {
         const data = await apiCall("/extract-sow/status");
         document.getElementById("statusBox").textContent = JSON.stringify(data, null, 2);
+        setSystemBadge(!!data.running);
+        setToggleButton(!!data.running);
+        const key = [data.current_file || "", data.processed_this_run || 0, data.running ? "run" : "idle"].join("|");
+        if (key !== uiState.lastActivityKey && data.current_file) {
+          uiState.lastActivityKey = key;
+          const ts = new Date().toLocaleTimeString();
+          appendActivity(`[${ts}] ${data.running ? "Processing" : "Last file"}: ${data.current_file}`);
+        }
+        if (data.last_error) {
+          appendActivity(`[${new Date().toLocaleTimeString()}] ERROR: ${data.last_error}`);
+        }
       } catch (err) {
         document.getElementById("statusBox").textContent = "Status error: " + err.message;
+        showToast("Failed to fetch /extract-sow/status", "error");
+      }
+    }
+
+    async function refreshStateCards() {
+      try {
+        const st = await apiCall("/state");
+        const by = st.by_doc_type || {};
+        document.getElementById("statTotal").textContent = st.processed_count || 0;
+        document.getElementById("statSow").textContent = by.sow || 0;
+        document.getElementById("statInv").textContent = by.invoice || 0;
+      } catch (err) {
+        showToast("Failed to fetch /state", "error");
       }
     }
 
     async function refreshDownloads() {
-      const box = document.getElementById("downloadLinks");
       try {
         const data = await apiCall("/download");
-        const files = (data && data.files) ? data.files : [];
-        if (!files.length) {
-          box.textContent = "No output files available yet.";
+        const files = (data && data.available_files) ? data.available_files : [];
+        const names = files.map(f => f.file).join(", ");
+        document.getElementById("downloadStatus").textContent = files.length ? `Available: ${names}` : "No outputs yet.";
+      } catch (err) {
+        document.getElementById("downloadStatus").textContent = "No outputs yet.";
+      }
+    }
+
+    async function refreshProblems() {
+      const body = document.getElementById("problemTableBody");
+      try {
+        const data = await apiCall("/debug/pdf/list-problems");
+        const rows = [];
+        ["invoice", "sow"].forEach(kind => {
+          const block = data[kind] || {};
+          (block.problems || []).forEach(p => {
+            rows.push({
+              kind,
+              file: p["Filename"] || "",
+              missing: (p["missing_fields"] || []).join(", "),
+              err: p["error"] || "",
+            });
+          });
+        });
+        document.getElementById("statErr").textContent = rows.length;
+        if (!rows.length) {
+          body.innerHTML = '<tr><td class="py-3 text-slate-500" colspan="4">No problems found.</td></tr>';
           return;
         }
-        box.innerHTML = files.map(f => `<div><a href="${f.url}">Download ${f.file}</a></div>`).join("");
+        body.innerHTML = rows.slice(0, 200).map(r => `
+          <tr class="border-b align-top">
+            <td class="py-2 pr-3 capitalize">${r.kind}</td>
+            <td class="py-2 pr-3 break-all">${r.file}</td>
+            <td class="py-2 pr-3 text-amber-700">${r.missing || "-"}</td>
+            <td class="py-2 pr-3 text-rose-700">${r.err || "-"}</td>
+          </tr>
+        `).join("");
       } catch (err) {
-        box.textContent = "Download list error: " + err.message;
+        body.innerHTML = '<tr><td class="py-3 text-rose-700" colspan="4">Failed to load problems.</td></tr>';
+        showToast("Failed to fetch problem list", "error");
       }
     }
 
     async function startJob() {
       try {
         const data = await apiCall("/extract-sow/start", "POST");
-        setMsg("Started: " + JSON.stringify(data), false);
-        refreshStatus();
+        showToast(data.message || "Started extraction", "ok");
+        await refreshStatus();
       } catch (err) {
-        setMsg("Start failed: " + err.message, true);
+        showToast("Start failed: " + err.message, "error");
       }
     }
 
     async function stopJob() {
       try {
         const data = await apiCall("/extract-sow/stop", "POST");
-        setMsg("Stop requested: " + JSON.stringify(data), false);
-        refreshStatus();
+        showToast(data.message || "Stop requested", "ok");
+        await refreshStatus();
         setTimeout(refreshDownloads, 1500);
       } catch (err) {
-        setMsg("Stop failed: " + err.message, true);
+        showToast("Stop failed: " + err.message, "error");
       }
     }
 
-    async function reprocessAll() {
+    async function processNow() {
+      const force = document.getElementById("forceReprocess").checked;
       try {
-        const data = await apiCall("/extract-sow/reprocess-all", "POST");
-        setMsg("Reprocess started: " + JSON.stringify(data), false);
-        refreshStatus();
+        const path = force ? "/extract-sow/?force_reprocess=true" : "/extract-sow/";
+        const data = await apiCall(path, "POST");
+        showToast((data && data.message) || "Manual processing complete", "ok");
+        await refreshAll();
       } catch (err) {
-        setMsg("Reprocess failed: " + err.message, true);
+        showToast("Manual trigger failed: " + err.message, "error");
       }
     }
 
-    async function scanOnly() {
+    async function toggleStartStop() {
+      const data = await apiCall("/extract-sow/status");
+      if (data.running) return stopJob();
+      return startJob();
+    }
+
+    async function runScan() {
       try {
         const data = await apiCall("/extract-sow/scan");
-        setMsg("Scan result: " + JSON.stringify(data), false);
+        document.getElementById("scanResult").textContent =
+          `Scan: total=${data.total}, new=${data.new_count}, changed=${data.changed_count}, up_to_date=${data.up_to_date_count}, to_process=${data.to_process}`;
+        showToast("Scan completed", "ok");
       } catch (err) {
-        setMsg("Scan failed: " + err.message, true);
+        showToast("Scan failed: " + err.message, "error");
       }
     }
 
-    refreshStatus();
-    refreshDownloads();
-    setInterval(refreshStatus, 5000);
-    setInterval(refreshDownloads, 15000);
+    async function refreshAll() {
+      await Promise.all([
+        refreshStatus(),
+        refreshStateCards(),
+        refreshDownloads(),
+        refreshProblems(),
+      ]);
+    }
+
+    refreshAll();
+    setInterval(refreshAll, 5000);
   </script>
 </body>
 </html>
