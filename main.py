@@ -6,6 +6,7 @@ Entry point: run with uvicorn or via Docker.
 import asyncio
 import logging
 import threading
+from io import BytesIO
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Callable, Optional
@@ -21,7 +22,7 @@ except Exception:  # noqa: S110
     pass
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 
@@ -640,6 +641,73 @@ async def download_file(file_name: str):
     )
 
 
+@app.get("/download/filtered/{file_name}")
+async def download_filtered_file(
+    file_name: str,
+    start_date: Optional[str] = Query(default=None, description="Include rows with Start Date on/after this date (YYYY-MM-DD)."),
+    end_date: Optional[str] = Query(default=None, description="Include rows with End Date on/before this date (YYYY-MM-DD)."),
+):
+    """
+    Download a filtered Excel by date range.
+    Filters on Start Date (>= start_date) and End Date (<= end_date) when provided.
+    """
+    path = EXCEL_OUTPUT_DIR / file_name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"File not found: {file_name}")
+    try:
+        df = pd.read_excel(path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not read Excel: {e}")
+
+    # Keep original if expected date columns are missing
+    if "Start Date" not in df.columns and "End Date" not in df.columns:
+        raise HTTPException(status_code=400, detail="This file does not contain Start Date/End Date columns.")
+
+    filtered = df.copy()
+    start_series = pd.to_datetime(filtered.get("Start Date"), errors="coerce")
+    end_series = pd.to_datetime(filtered.get("End Date"), errors="coerce")
+
+    if start_date:
+        try:
+            start_cutoff = pd.to_datetime(start_date, errors="raise")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid start_date format. Use YYYY-MM-DD.")
+        # Include when Start Date exists and is >= cutoff; fallback to End Date when Start Date missing
+        start_effective = start_series.fillna(end_series)
+        filtered = filtered[start_effective >= start_cutoff]
+
+    if end_date:
+        try:
+            end_cutoff = pd.to_datetime(end_date, errors="raise")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid end_date format. Use YYYY-MM-DD.")
+        # Include when End Date exists and is <= cutoff; fallback to Start Date when End Date missing
+        end_effective = end_series.fillna(start_series)
+        filtered = filtered[end_effective <= end_cutoff]
+
+    output = BytesIO()
+    try:
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            filtered.to_excel(writer, index=False)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not build filtered Excel: {e}")
+    output.seek(0)
+
+    suffix = []
+    if start_date:
+        suffix.append(f"from_{start_date}")
+    if end_date:
+        suffix.append(f"to_{end_date}")
+    name_suffix = "_".join(suffix) if suffix else "all"
+    out_name = f"{Path(file_name).stem}_filtered_{name_suffix}.xlsx"
+    from fastapi.responses import Response
+    return Response(
+        content=output.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
+    )
+
+
 @app.get("/download")
 async def download_list():
     """List available output Excels with download links."""
@@ -809,6 +877,27 @@ async def read_index():
           <a class="block w-full text-center px-3 py-2 rounded-md bg-slate-900 text-white hover:bg-slate-700" href="/download/license_metrics.xlsx">Download license_metrics.xlsx</a>
           <a class="block w-full text-center px-3 py-2 rounded-md bg-slate-900 text-white hover:bg-slate-700" href="/download/contract_metrics.xlsx">Download contract_metrics.xlsx</a>
         </div>
+        <div class="mt-4 border-t pt-3">
+          <div class="text-sm font-medium mb-2">Filtered Download (Date Range)</div>
+          <label class="block text-xs text-slate-600 mb-1">File</label>
+          <select id="filterFile" class="w-full border rounded-md px-2 py-2 text-sm">
+            <option value="license_metrics.xlsx">license_metrics.xlsx</option>
+            <option value="contract_metrics.xlsx">contract_metrics.xlsx</option>
+          </select>
+          <div class="grid grid-cols-2 gap-2 mt-2">
+            <div>
+              <label class="block text-xs text-slate-600 mb-1">Start Date (from)</label>
+              <input id="filterStartDate" type="date" class="w-full border rounded-md px-2 py-2 text-sm" />
+            </div>
+            <div>
+              <label class="block text-xs text-slate-600 mb-1">End Date (to)</label>
+              <input id="filterEndDate" type="date" class="w-full border rounded-md px-2 py-2 text-sm" />
+            </div>
+          </div>
+          <button onclick="downloadFiltered()" class="w-full mt-3 px-3 py-2 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 text-sm">
+            Download Filtered Excel
+          </button>
+        </div>
         <div id="downloadStatus" class="text-xs text-slate-500 mt-3"></div>
       </div>
     </section>
@@ -846,22 +935,6 @@ async def read_index():
       </div>
     </section>
 
-    <section class="mt-4 rounded-xl bg-white border border-slate-200 p-4 shadow-sm">
-      <h2 class="text-lg font-semibold mb-3">Problem List</h2>
-      <div class="overflow-auto">
-        <table class="min-w-full text-sm">
-          <thead>
-            <tr class="text-left border-b">
-              <th class="py-2 pr-3">Type</th>
-              <th class="py-2 pr-3">Filename</th>
-              <th class="py-2 pr-3">Missing Fields</th>
-              <th class="py-2 pr-3">Error</th>
-            </tr>
-          </thead>
-          <tbody id="problemTableBody"></tbody>
-        </table>
-      </div>
-    </section>
   </div>
 
   <div id="toastHost" class="fixed right-4 top-4 z-50 space-y-2"></div>
@@ -944,12 +1017,32 @@ async def read_index():
       box.scrollTop = box.scrollHeight;
     }
 
+    function renderReadableStatus(data) {
+      const phase = data.phase || "idle";
+      const total = (data.total_to_process && data.total_to_process > 0) ? data.total_to_process : "discovering...";
+      const current = data.current_file || "-";
+      const err = data.last_error || "None";
+      const stop = data.stop_requested ? "Yes" : "No";
+      const running = data.running ? "Yes" : "No";
+      return [
+        `Running: ${running}`,
+        `Phase: ${phase}`,
+        `Processed this run: ${data.processed_this_run || 0}`,
+        `Total to process: ${total}`,
+        `Current file: ${current}`,
+        `Stop requested: ${stop}`,
+        `Total rows in output excel(s): ${data.total_in_excel || 0}`,
+        `Last error: ${err}`,
+      ].join("\\n");
+    }
+
     async function refreshStatus() {
       try {
         const data = await apiCall("/extract-sow/status");
-        document.getElementById("statusBox").textContent = JSON.stringify(data, null, 2);
+        document.getElementById("statusBox").textContent = renderReadableStatus(data);
         setSystemBadge(!!data.running);
         setToggleButton(!!data.running);
+        document.getElementById("statErr").textContent = data.last_error ? 1 : 0;
         const key = [data.current_file || "", data.processed_this_run || 0, data.running ? "run" : "idle"].join("|");
         if (key !== uiState.lastActivityKey && data.current_file) {
           uiState.lastActivityKey = key;
@@ -988,39 +1081,15 @@ async def read_index():
       }
     }
 
-    async function refreshProblems() {
-      const body = document.getElementById("problemTableBody");
-      try {
-        const data = await apiCall("/debug/pdf/list-problems");
-        const rows = [];
-        ["invoice", "sow"].forEach(kind => {
-          const block = data[kind] || {};
-          (block.problems || []).forEach(p => {
-            rows.push({
-              kind,
-              file: p["Filename"] || "",
-              missing: (p["missing_fields"] || []).join(", "),
-              err: p["error"] || "",
-            });
-          });
-        });
-        document.getElementById("statErr").textContent = rows.length;
-        if (!rows.length) {
-          body.innerHTML = '<tr><td class="py-3 text-slate-500" colspan="4">No problems found.</td></tr>';
-          return;
-        }
-        body.innerHTML = rows.slice(0, 200).map(r => `
-          <tr class="border-b align-top">
-            <td class="py-2 pr-3 capitalize">${r.kind}</td>
-            <td class="py-2 pr-3 break-all">${r.file}</td>
-            <td class="py-2 pr-3 text-amber-700">${r.missing || "-"}</td>
-            <td class="py-2 pr-3 text-rose-700">${r.err || "-"}</td>
-          </tr>
-        `).join("");
-      } catch (err) {
-        body.innerHTML = '<tr><td class="py-3 text-rose-700" colspan="4">Failed to load problems.</td></tr>';
-        showToast("Failed to fetch problem list", "error");
-      }
+    function downloadFiltered() {
+      const file = document.getElementById("filterFile").value;
+      const start = document.getElementById("filterStartDate").value;
+      const end = document.getElementById("filterEndDate").value;
+      const params = new URLSearchParams();
+      if (start) params.set("start_date", start);
+      if (end) params.set("end_date", end);
+      const url = buildUrl(`/download/filtered/${encodeURIComponent(file)}${params.toString() ? "?" + params.toString() : ""}`);
+      window.location.href = url;
     }
 
     async function startJob() {
@@ -1078,12 +1147,10 @@ async def read_index():
         refreshStatus(),
         refreshStateCards(),
         refreshDownloads(),
-        refreshProblems(),
       ]);
     }
 
     refreshAll();
-    setInterval(refreshAll, 5000);
   </script>
 </body>
 </html>
