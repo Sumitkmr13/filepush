@@ -756,38 +756,141 @@ async def debug_pdf_list_problems():
 
 @app.get("/", response_class=HTMLResponse)
 async def read_index():
-    """Serve simple landing page."""
+    """Serve static UI page for extraction controls and downloads."""
     return HTMLResponse(content="""
-<h1>Contract &amp; Invoice RAG Extractor</h1>
-<p>Each processed PDF is classified as a <b>SOW Document</b> or <b>License Invoice</b> and written to the matching Excel.
-Filenames in the Excel are clickable hyperlinks back to SharePoint.</p>
-<h3>Extraction</h3>
-<ul>
-  <li><b>POST /extract-sow/start</b> — start in background (Smart Resume: skips already-processed files)</li>
-  <li><b>GET /extract-sow/status</b> — poll progress</li>
-  <li><b>POST /extract-sow/stop</b> — stop after current PDF; both Excels are saved + uploaded to GCS</li>
-  <li><b>POST /extract-sow/reprocess-all</b> — reprocess every PDF from scratch (ignore state)</li>
-  <li><b>POST /extract-sow/</b> — run synchronously (add ?force_reprocess=true to reprocess all)</li>
-</ul>
-<h3>Scan (no processing)</h3>
-<ul>
-  <li><b>GET /extract-sow/scan</b> — count new/changed PDFs without processing</li>
-</ul>
-<h3>Download</h3>
-<ul>
-  <li><b>GET /download</b> — list available output files</li>
-  <li><b>GET /download/sow_results.xlsx</b> — SOW Document Excel</li>
-  <li><b>GET /download/invoice_results.xlsx</b> — License Invoice Excel</li>
-</ul>
-<h3>State &amp; Debug</h3>
-<ul>
-  <li><b>GET /state</b> — summary with counts by doc_type (sow/invoice)</li>
-  <li><b>GET /state/by-type?doc_type=sow</b> — list processed files classified as SOW</li>
-  <li><b>GET /state/by-type?doc_type=invoice</b> — list processed files classified as Invoice</li>
-  <li><b>GET /debug/pdf/list-problems</b> — rows with missing fields in both Excels</li>
-  <li><b>GET /debug/pdf/inspect?item_id=...</b> — extract text + fields for one PDF</li>
-  <li><b>GET /debug/pdf/download?item_id=...</b> — download a specific PDF to your device</li>
-</ul>
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Contract & Invoice Extractor</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; max-width: 980px; }
+    h1 { margin-bottom: 8px; }
+    .muted { color: #555; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin: 14px 0; }
+    button { margin-right: 8px; margin-top: 8px; padding: 8px 12px; cursor: pointer; }
+    .ok { color: #0a7d2e; }
+    .err { color: #b00020; }
+    pre { background: #f7f7f7; border: 1px solid #e8e8e8; border-radius: 6px; padding: 10px; overflow-x: auto; }
+    a { text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <h1>Contract & Invoice Extractor</h1>
+  <p class="muted">Start/stop extraction jobs and download one or both generated Excel files.</p>
+
+  <div class="card">
+    <h3>Extraction Controls</h3>
+    <button onclick="startJob()">Start (Smart Resume)</button>
+    <button onclick="stopJob()">Stop</button>
+    <button onclick="reprocessAll()">Reprocess All</button>
+    <button onclick="scanOnly()">Scan Only</button>
+    <button onclick="refreshStatus()">Refresh Status</button>
+    <div id="actionMsg" class="muted" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="card">
+    <h3>Live Status</h3>
+    <pre id="statusBox">Loading...</pre>
+  </div>
+
+  <div class="card">
+    <h3>Downloads</h3>
+    <div id="downloadLinks" class="muted">Loading available files...</div>
+    <button onclick="refreshDownloads()">Refresh Downloads</button>
+  </div>
+
+  <script>
+    async function apiCall(url, method) {
+      const res = await fetch(url, { method: method || "GET" });
+      const text = await res.text();
+      let payload = text;
+      try { payload = JSON.parse(text); } catch (e) {}
+      if (!res.ok) {
+        throw new Error(typeof payload === "string" ? payload : JSON.stringify(payload));
+      }
+      return payload;
+    }
+
+    function setMsg(msg, isErr) {
+      const el = document.getElementById("actionMsg");
+      el.className = isErr ? "err" : "ok";
+      el.textContent = msg;
+    }
+
+    async function refreshStatus() {
+      try {
+        const data = await apiCall("/extract-sow/status");
+        document.getElementById("statusBox").textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        document.getElementById("statusBox").textContent = "Status error: " + err.message;
+      }
+    }
+
+    async function refreshDownloads() {
+      const box = document.getElementById("downloadLinks");
+      try {
+        const data = await apiCall("/download");
+        const files = (data && data.files) ? data.files : [];
+        if (!files.length) {
+          box.textContent = "No output files available yet.";
+          return;
+        }
+        box.innerHTML = files.map(f => `<div><a href="${f.url}">Download ${f.file}</a></div>`).join("");
+      } catch (err) {
+        box.textContent = "Download list error: " + err.message;
+      }
+    }
+
+    async function startJob() {
+      try {
+        const data = await apiCall("/extract-sow/start", "POST");
+        setMsg("Started: " + JSON.stringify(data), false);
+        refreshStatus();
+      } catch (err) {
+        setMsg("Start failed: " + err.message, true);
+      }
+    }
+
+    async function stopJob() {
+      try {
+        const data = await apiCall("/extract-sow/stop", "POST");
+        setMsg("Stop requested: " + JSON.stringify(data), false);
+        refreshStatus();
+        setTimeout(refreshDownloads, 1500);
+      } catch (err) {
+        setMsg("Stop failed: " + err.message, true);
+      }
+    }
+
+    async function reprocessAll() {
+      try {
+        const data = await apiCall("/extract-sow/reprocess-all", "POST");
+        setMsg("Reprocess started: " + JSON.stringify(data), false);
+        refreshStatus();
+      } catch (err) {
+        setMsg("Reprocess failed: " + err.message, true);
+      }
+    }
+
+    async function scanOnly() {
+      try {
+        const data = await apiCall("/extract-sow/scan");
+        setMsg("Scan result: " + JSON.stringify(data), false);
+      } catch (err) {
+        setMsg("Scan failed: " + err.message, true);
+      }
+    }
+
+    refreshStatus();
+    refreshDownloads();
+    setInterval(refreshStatus, 5000);
+    setInterval(refreshDownloads, 15000);
+  </script>
+</body>
+</html>
 """)
 
 
