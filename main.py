@@ -37,7 +37,11 @@ from config import (
     SOW_FIELDS,
     GCS_OUTPUT_BUCKET,
 )
-from data_utils import clean_amount, clean_date, remove_duplicate_entries
+from data_utils import (
+    clean_amount,
+    dedupe_same_content_latest_revision,
+    remove_duplicate_entries,
+)
 from state_manager import (
     classify_item,
     get_processed_ids,
@@ -111,8 +115,8 @@ def _start_monitor_if_enabled() -> None:
     t.start()
 
 
-_DATE_COLS = {"Start Date", "End Date"}
-_AMOUNT_COLS = {"Commercial Value", "TCV"}
+# Start/End dates are stored as extracted (original document format); not normalized to ISO.
+_AMOUNT_COLS = {"Commercial Value", "TCV", "Annual Value"}
 
 
 def _load_existing_excel(excel_path: Path, output_fields: list) -> Optional[pd.DataFrame]:
@@ -209,13 +213,14 @@ def _write_excel(
                 new_df[col] = ""
         new_df = new_df[[c for c in base_cols + ["Error"] if c in new_df.columns]].copy()
         for col in new_df.columns:
-            if col in _DATE_COLS:
-                new_df[col] = new_df[col].apply(clean_date)
-            elif col in _AMOUNT_COLS:
+            if col in _AMOUNT_COLS:
                 new_df[col] = new_df[col].apply(clean_amount)
         df = pd.concat([df, new_df], ignore_index=True)
 
-    df = remove_duplicate_entries(df, fields=output_fields)
+    # Same agreement + same filename base + revision markers → keep latest revision only
+    df = dedupe_same_content_latest_revision(df, output_fields)
+    # Exact duplicate rows (e.g. same file processed twice); include Filename so rev variants are not collapsed here
+    df = remove_duplicate_entries(df, fields=output_fields + ["Filename"])
     df.to_excel(str(excel_path), index=False)
     _apply_filename_hyperlinks(excel_path)
     logger.info("%s saved (%s rows).", excel_path.name, len(df))

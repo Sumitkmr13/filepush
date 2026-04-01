@@ -196,10 +196,11 @@ Field definitions for invoices:
   "Contract Type": e.g. Addendum / Subscription, Perpetual, Service / PO
   "Billing Frequency": e.g. Annual, One-time, Project-based
   "Currency": 3-letter code (USD, EUR, RUB) or symbol ($, €)
-  "Start Date": contract start date in original format
-  "End Date": contract end date in original format
+  "Start Date": contract start date exactly as printed in the document (original format); parent-level dates apply to the whole agreement
+  "End Date": contract end date exactly as printed in the document (original format)
   "Products / Modules": comma-separated product/module/SKU names for this table entry
   "TCV": total monetary value for this table entry (e.g. "$97,000")
+  "Annual Value": per-year amount when applicable — use stated annual/yearly fee if printed; if only multi-year TCV and term length in years is clear (from dates or text), compute TCV divided by full years (e.g. $30,000 TCV over 3 years → "$10,000"); for a one-year term annual may equal TCV; null if not derivable
   "Pricing Model": e.g. Fixed, Hybrid (Fixed + User)
   "Licenses Purchased": quantity + unit (e.g. "10 Users (WebInsight)", "16 Seats")
 
@@ -211,9 +212,11 @@ For **SOW Document**, return:
   "fields": {{ {sow_fields} }}
 
 Field definitions for SOW:
+  "Contract ID": agreement or reference ID if shown (otherwise null)
+  "Vendor": supplier / services provider / counterparty legal name if shown (otherwise null)
   "Contract Name": formal contract or Statement of Work title
-  "Start Date": contract start date
-  "End Date": contract end date
+  "Start Date": contract start date exactly as printed in the document (original format)
+  "End Date": contract end date exactly as printed in the document (original format)
   "Commercial Value": total contract value (amount only)
   "Currency": 3-letter code or symbol
   "Owner/Contact": primary owner or contact name
@@ -222,7 +225,7 @@ RULES:
 - Return a single valid JSON object. No markdown, no code fences, no conversational text.
 - If a value is not found in the document, use null.
 - Never invent values not supported by the document text.
-- Dates should be in their original format as found in the document.
+- Dates: copy Start Date and End Date in the original format from the document; do not convert to a different date format.
 - For amounts, include currency symbol if present (e.g. "$130,600").
 """.format(
     parent_fields=_PARENT_FIELDS_STR,
@@ -323,7 +326,10 @@ def _parse_extraction_response(
         for item in line_items:
             row = dict(base)
             for f in INVOICE_LINE_FIELDS:
-                row[f] = _safe_str(item.get(f))
+                v = _safe_str(item.get(f))
+                if not v and f == "Annual Value":
+                    v = _safe_str(item.get("annual_value"))
+                row[f] = v
             rows.append(row)
 
         logger.info(
