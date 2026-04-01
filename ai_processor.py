@@ -85,7 +85,14 @@ Use the language name in English (e.g. Russian, not русский). Then leave 
 In all cases:
 - Extract ALL visible text (including handwritten notes, scanned images, and fine-print).
 - Maintain layout, tables, and headers faithfully.
-- For tables: preserve ALL columns (ITEM, MATERIAL DESCRIPTION, VENDOR PART NUMBER, QUANTITY, UNIT, UNIT PRICE, AMOUNT, etc.). Render each row on its own line with columns separated by tabs or aligned spacing.
+- For tables with columns (e.g. ITEM | MATERIAL DESCRIPTION | QUANTITY | UNIT | UNIT PRICE | AMOUNT):
+  * First output the header row exactly as printed, with column names separated by " | ".
+  * Then output each data row with values separated by " | " in the same column order.
+  * Example output for a PO table:
+    ITEM | MATERIAL DESCRIPTION | VENDOR PART NUMBER | QUANTITY | UNIT | UNIT PRICE | AMOUNT
+    D0010 | Adobe Pro, Photoshop, InDesign C Cloud | | 49,963.160 | AU | 1.0000 | 45,963.36
+    D0020 | Adobe Pro 100 Licenses | | 11,268.000 | AU | 1.0000 | 11,268.00
+  * This column-separated format is critical — downstream extraction depends on correctly distinguishing QUANTITY from UNIT PRICE and UNIT from DESCRIPTION.
 - For per-line-item annotations (e.g. "Delivery date: 01/26/2023", "Goods recipient: ...", "*** Item completely delivered ***"): include them on separate lines directly after the table row they belong to.
 - Your output must always be in English (after the DETECTED_LANGUAGE line) so we can process every file the same way."""
 
@@ -206,14 +213,20 @@ Field definitions for invoices — PARENT (document-level):
 
 Field definitions for invoices — LINE ITEMS (per row in the pricing table):
   "Products / Modules": product name, material description, or SKU for this line
-  "Quantity": numeric quantity for this line item. Copy the number exactly as printed.
-              Examples: "49,963.160" (from QUANTITY column), "1.000", "10" (from "10 Users"), "16" (from "16 Seats").
-  "Unit": unit of measure for this line item. Copy from the UNIT column or derive from context.
-          Examples: "AU", "EA", "Seats", "Users", "Licenses", "Subscription".
-          If the document says "10 Users" → Quantity="10", Unit="Users".
-          If the document says "16 Seats" → Quantity="16", Unit="Seats".
-          If the document says "1 Company Membership" → Quantity="1", Unit="Company Membership".
-  "TCV": total monetary value / amount for this line item (e.g. "$49,963.16"). This is typically the AMOUNT column.
+  "Quantity": the value from the QUANTITY column of the table. This is typically a large number representing
+              volume, count, or license units. Copy the number exactly as printed.
+              IMPORTANT: Do NOT confuse QUANTITY with UNIT PRICE. In a typical PO table the columns are:
+                ITEM | MATERIAL DESCRIPTION | VENDOR PART NUMBER | QUANTITY | UNIT | UNIT PRICE | AMOUNT
+              The QUANTITY column is BEFORE the UNIT column. UNIT PRICE is a DIFFERENT column (usually 1.0000 or a per-unit cost).
+              Examples of correct Quantity values: "49,963.160", "11,268.000", "2,500.000", "1,173.750", "10", "16".
+              If there is no table (e.g. "10 Users" in prose) → Quantity="10".
+  "Unit": the value from the UNIT column of the table. This is a short code like "AU", "EA", "PC", "LIC".
+          IMPORTANT: Read the UNIT column directly — do NOT infer unit from the product name.
+          In a PO table with columns QUANTITY | UNIT | UNIT PRICE, the UNIT column is between QUANTITY and UNIT PRICE.
+          Examples of correct Unit values: "AU", "EA", "PC", "LIC", "Seats", "Users".
+          Only if there is no UNIT column in the table, derive from context (e.g. "10 Users" → Unit="Users").
+  "TCV": total monetary value / amount for this line item (the AMOUNT column, NOT the UNIT PRICE column).
+         Example: if UNIT PRICE is 1.0000 and AMOUNT is 45,963.36 → TCV = "$45,963.36".
   "Annual Value": per-year amount. Compute as follows:
       - If billing is Annual/Yearly: Annual Value = TCV.
       - If billing is One-time and term is 1 year (or no multi-year term stated): Annual Value = TCV.
@@ -254,8 +267,11 @@ RULES:
 - Never invent values not supported by the document text.
 - Dates: copy exactly as printed in the document; do not convert to a different format.
 - For amounts, include currency symbol if present (e.g. "$130,600").
-- For Quantity: extract the numeric part only (e.g. from "10 Users" → "10"; from QUANTITY column "49,963.160" → "49,963.160").
-- For Unit: extract the unit part (e.g. from "10 Users" → "Users"; from UNIT column "AU" → "AU").
+- CRITICAL for PO / invoice tables with columns like ITEM | DESCRIPTION | QUANTITY | UNIT | UNIT PRICE | AMOUNT:
+    * Quantity = the QUANTITY column value (e.g. 49,963.160 or 11,268.000). NOT the UNIT PRICE.
+    * Unit = the UNIT column value (e.g. "AU", "EA"). NOT derived from the product description.
+    * TCV = the AMOUNT column value (the total for that row). NOT the UNIT PRICE.
+    * UNIT PRICE is a per-unit cost — do not use it as Quantity or TCV.
 - For Annual Value: always try to compute it from TCV and billing frequency / term length. Only use null as last resort.
 """.format(
     parent_fields=_PARENT_FIELDS_STR,
