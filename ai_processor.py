@@ -82,7 +82,12 @@ Use the language name in English (e.g. Russian, not русский). Then leave 
 - If the document is NOT in English: translate it into English while maintaining the layout, tables, and headers. Output the full translated text after the DETECTED_LANGUAGE line.
 - If the document is already in English: perform a standard OCR transcription only.
 
-In all cases: extract all visible text (including handwritten notes or scanned images); maintain layout, tables, and headers. Your output must always be in English (after the DETECTED_LANGUAGE line) so we can process every file the same way."""
+In all cases:
+- Extract ALL visible text (including handwritten notes, scanned images, and fine-print).
+- Maintain layout, tables, and headers faithfully.
+- For tables: preserve ALL columns (ITEM, MATERIAL DESCRIPTION, VENDOR PART NUMBER, QUANTITY, UNIT, UNIT PRICE, AMOUNT, etc.). Render each row on its own line with columns separated by tabs or aligned spacing.
+- For per-line-item annotations (e.g. "Delivery date: 01/26/2023", "Goods recipient: ...", "*** Item completely delivered ***"): include them on separate lines directly after the table row they belong to.
+- Your output must always be in English (after the DETECTED_LANGUAGE line) so we can process every file the same way."""
 
 _DETECTED_LANGUAGE_RE = re.compile(
     r"^\s*DETECTED_LANGUAGE:\s*(.+?)(?:\s*$)", re.IGNORECASE | re.MULTILINE
@@ -173,39 +178,61 @@ _EXTRACTION_PROMPT = """You are a financial analyst reviewing contract and invoi
 TASK: Extract structured data from the document text below.
 
 STEP 1 — Classify the document:
-  Decide if this is a "License Invoice" (software licence, subscription, vendor invoice for products/SKUs)
-  or an "SOW Document" (Statement of Work, professional services contract).
+  Decide if this is a "License Invoice" (software licence, subscription, vendor invoice for products/SKUs,
+  purchase order) or an "SOW Document" (Statement of Work, professional services contract).
 
 STEP 2 — Extract fields based on document type.
 
-For **License Invoice** documents, the document may contain ONE or MORE distinct pricing tables.
-Each table has its own products/modules, total cost (TCV), pricing model, and licence units.
+For **License Invoice** documents, the document may contain ONE or MORE distinct line items / rows in a pricing table.
+Each line item has its own product name, quantity, unit, cost, and optionally its own dates.
 Return a JSON object with:
   "document_type": "License Invoice"
-  "parent": {{ {parent_fields} }}
+  "parent": {{ {parent_fields}, "Start Date": "...", "End Date": "..." }}
   "line_items": [
-    {{ {line_fields} }}     ← one object per pricing table
+    {{ {line_fields} }}     ← one object per distinct line item / row
   ]
 
-Field definitions for invoices:
-  "Contract ID": contract or agreement reference ID
+Field definitions for invoices — PARENT (document-level):
+  "Contract ID": contract, PO number, or agreement reference ID (look for labels like PO Number, Order Number, Contract ID)
   "Vendor": supplier / licensor legal name
-  "Customer": buyer / licensee legal name
+  "Customer": buyer / licensee / "Bill To" legal name
   "Contract Type": e.g. Addendum / Subscription, Perpetual, Service / PO
   "Billing Frequency": e.g. Annual, One-time, Project-based
   "Currency": 3-letter code (USD, EUR, RUB) or symbol ($, €)
-  "Start Date": contract start date exactly as printed in the document (original format); parent-level dates apply to the whole agreement.
-                If date labels are "Order Date"/"PO Date", map that value to "Start Date".
-  "End Date": contract end date exactly as printed in the document (original format).
-              If date labels are "Delivery Date"/"Due Date", map that value to "End Date".
-  "Products / Modules": comma-separated product/module/SKU names for this table entry
-  "TCV": total monetary value for this table entry (e.g. "$97,000")
-  "Annual Value": per-year amount when applicable — use stated annual/yearly fee if printed; if only multi-year TCV and term length in years is clear (from dates or text), compute TCV divided by full years (e.g. $30,000 TCV over 3 years → "$10,000"); for a one-year term annual may equal TCV; null if not derivable
-  "Pricing Model": e.g. Fixed, Hybrid (Fixed + User)
-  "Licenses Purchased": quantity + unit (e.g. "10 Users (WebInsight)", "16 Seats")
+  "Start Date": the main document-level start date. Look for: Start Date, Order Date, PO Date, Agreement Date.
+                Copy exactly as printed (original format). This is the default date for all line items.
+  "End Date": the main document-level end date. Look for: End Date, Expiration Date, Due Date.
+              Copy exactly as printed (original format). null if not present at document level.
 
-If a document has TWO separate pricing tables with different costs, "line_items" MUST have two objects.
-If only one table exists, "line_items" has one object.
+Field definitions for invoices — LINE ITEMS (per row in the pricing table):
+  "Products / Modules": product name, material description, or SKU for this line
+  "Quantity": numeric quantity for this line item. Copy the number exactly as printed.
+              Examples: "49,963.160" (from QUANTITY column), "1.000", "10" (from "10 Users"), "16" (from "16 Seats").
+  "Unit": unit of measure for this line item. Copy from the UNIT column or derive from context.
+          Examples: "AU", "EA", "Seats", "Users", "Licenses", "Subscription".
+          If the document says "10 Users" → Quantity="10", Unit="Users".
+          If the document says "16 Seats" → Quantity="16", Unit="Seats".
+          If the document says "1 Company Membership" → Quantity="1", Unit="Company Membership".
+  "TCV": total monetary value / amount for this line item (e.g. "$49,963.16"). This is typically the AMOUNT column.
+  "Annual Value": per-year amount. Compute as follows:
+      - If billing is Annual/Yearly: Annual Value = TCV.
+      - If billing is One-time and term is 1 year (or no multi-year term stated): Annual Value = TCV.
+      - If billing is One-time and term spans N years: Annual Value = TCV / N.
+      - If it cannot be determined: null.
+  "Pricing Model": e.g. Fixed, Per Unit, Hybrid (Fixed + User), Paid Up
+  "Start Date": date for this specific line item. If the line item has its own start/order date, use it.
+                Otherwise, copy the parent-level Start Date. Must not be null if parent has a date.
+  "End Date": end/delivery date for this specific line item. If the line item has its own delivery/end date
+              (e.g. "Delivery date: 01/26/2023" printed below the row), use that.
+              Otherwise, copy the parent-level End Date (or null if parent also has none).
+
+IMPORTANT for dates:
+  - ALWAYS include Start Date and End Date in the "parent" object if any document-level date exists.
+  - Purchase orders: "PO Date" at the top → parent "Start Date"; per-line "Delivery date:" → that line's "End Date".
+  - Subscription contracts: "Start Date" / "End Date" at document level → parent dates + copy to each line item.
+  - Always copy the date exactly as it appears in the document. Do not reformat.
+
+If a document has THREE line items in the table, "line_items" MUST have three objects — one per row.
 
 For **SOW Document**, return:
   "document_type": "SOW Document"
@@ -225,8 +252,11 @@ RULES:
 - Return a single valid JSON object. No markdown, no code fences, no conversational text.
 - If a value is not found in the document, use null.
 - Never invent values not supported by the document text.
-- Dates: copy Start Date and End Date in the original format from the document; do not convert to a different date format.
+- Dates: copy exactly as printed in the document; do not convert to a different format.
 - For amounts, include currency symbol if present (e.g. "$130,600").
+- For Quantity: extract the numeric part only (e.g. from "10 Users" → "10"; from QUANTITY column "49,963.160" → "49,963.160").
+- For Unit: extract the unit part (e.g. from "10 Users" → "Users"; from UNIT column "AU" → "AU").
+- For Annual Value: always try to compute it from TCV and billing frequency / term length. Only use null as last resort.
 """.format(
     parent_fields=_PARENT_FIELDS_STR,
     line_fields=_LINE_FIELDS_STR,
@@ -347,19 +377,35 @@ def _derive_annual_value(tcv: str, start_date: str, end_date: str, billing_frequ
         return ""
     currency = _extract_currency_prefix(tcv)
     freq = (billing_frequency or "").strip().lower()
+
+    annual: Optional[float] = None
+
     if "annual" in freq or "year" in freq:
         annual = amount
+    elif freq in ("one-time", "one time", "onetime", "single", "once"):
+        start = _parse_date(start_date)
+        end = _parse_date(end_date)
+        if start and end and end > start:
+            years = (end - start).days / 365.25
+            rounded_years = max(1, round(years))
+            annual = amount / rounded_years
+        else:
+            annual = amount
     else:
         start = _parse_date(start_date)
         end = _parse_date(end_date)
-        if not start or not end or end <= start:
-            return ""
-        years = (end - start).days / 365.25
-        # Only derive when the term looks clearly year-based.
-        rounded_years = round(years)
-        if rounded_years < 1 or abs(years - rounded_years) > 0.2:
-            return ""
-        annual = amount / rounded_years
+        if start and end and end > start:
+            years = (end - start).days / 365.25
+            rounded_years = round(years)
+            if rounded_years >= 1 and abs(years - rounded_years) <= 0.25:
+                annual = amount / rounded_years
+            elif years < 1:
+                annual = amount
+        elif not start or not end:
+            annual = amount
+
+    if annual is None:
+        return ""
     formatted = f"{annual:,.0f}"
     return f"{currency} {formatted}".strip() if currency else formatted
 
@@ -387,14 +433,12 @@ def _parse_extraction_response(
     if is_invoice:
         parent = data.get("parent") or {}
         for f in INVOICE_PARENT_FIELDS:
-            if f == "Start Date":
-                base[f] = _first_non_empty(parent, ["Start Date", "start_date", "Order Date", "order_date", "PO Date", "po_date"])
-            elif f == "End Date":
-                base[f] = _first_non_empty(parent, ["End Date", "end_date", "Delivery Date", "delivery_date", "Due Date", "due_date"])
-            else:
-                base[f] = _safe_str(parent.get(f))
+            base[f] = _safe_str(parent.get(f))
 
-        # SOW-only fields are empty for invoices
+        # Parent-level dates serve as fallback for line items that lack their own dates.
+        parent_start = _first_non_empty(parent, ["Start Date", "start_date", "Order Date", "order_date", "PO Date", "po_date"])
+        parent_end = _first_non_empty(parent, ["End Date", "end_date", "Delivery Date", "delivery_date", "Due Date", "due_date"])
+
         for f in ("Contract Name", "Commercial Value", "Owner/Contact"):
             base[f] = ""
 
@@ -408,17 +452,33 @@ def _parse_extraction_response(
         for item in line_items:
             row = dict(base)
             for f in INVOICE_LINE_FIELDS:
-                v = _safe_str(item.get(f))
-                if not v and f == "Annual Value":
-                    v = _safe_str(item.get("annual_value"))
-                if not v and f == "Annual Value":
-                    v = _derive_annual_value(
-                        tcv=_safe_str(item.get("TCV")) or _safe_str(item.get("tcv")),
-                        start_date=base.get("Start Date", ""),
-                        end_date=base.get("End Date", ""),
-                        billing_frequency=base.get("Billing Frequency", ""),
-                    )
+                if f == "Start Date":
+                    v = _first_non_empty(item, ["Start Date", "start_date", "Order Date", "order_date", "PO Date", "po_date"])
+                    if not v:
+                        v = parent_start
+                elif f == "End Date":
+                    v = _first_non_empty(item, ["End Date", "end_date", "Delivery Date", "delivery_date", "Due Date", "due_date"])
+                    if not v:
+                        v = parent_end
+                elif f == "Quantity":
+                    v = _first_non_empty(item, ["Quantity", "quantity", "Qty", "qty"])
+                elif f == "Unit":
+                    v = _first_non_empty(item, ["Unit", "unit", "UOM", "uom", "Unit of Measure"])
+                elif f == "Annual Value":
+                    v = _safe_str(item.get(f))
+                    if not v:
+                        v = _safe_str(item.get("annual_value"))
+                else:
+                    v = _safe_str(item.get(f))
                 row[f] = v
+
+            if not row.get("Annual Value"):
+                row["Annual Value"] = _derive_annual_value(
+                    tcv=_safe_str(item.get("TCV")) or _safe_str(item.get("tcv")),
+                    start_date=row.get("Start Date", ""),
+                    end_date=row.get("End Date", ""),
+                    billing_frequency=base.get("Billing Frequency", ""),
+                )
             rows.append(row)
 
         logger.info(
