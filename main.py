@@ -54,6 +54,7 @@ from sharepoint_utils import (
     list_pdf_items_streaming,
     download_file_bytes,
 )
+# Single-shot extraction: root ai_processor.py only (Gemini OCR + JSON extraction).
 from ai_processor import _normalize_field_value, debug_pdf_bytes, process_pdf_bytes
 
 # Internal key used to carry the SharePoint web URL through the result row dict.
@@ -215,6 +216,30 @@ def _write_excel(
         for col in new_df.columns:
             if col in _AMOUNT_COLS:
                 new_df[col] = new_df[col].apply(clean_amount)
+        # Replace stale rows when the same file is reprocessed.
+        if not df.empty:
+            new_keys = set(
+                zip(
+                    new_df["Filename"].astype(str).str.strip(),
+                    new_df[_URL_KEY].astype(str).str.strip(),
+                )
+            )
+            if new_keys:
+                existing_keys = list(
+                    zip(
+                        df["Filename"].astype(str).str.strip(),
+                        df[_URL_KEY].astype(str).str.strip(),
+                    )
+                )
+                keep_mask = [k not in new_keys for k in existing_keys]
+                replaced = len(df) - sum(keep_mask)
+                if replaced > 0:
+                    logger.info(
+                        "Replacing %s existing row(s) for reprocessed files in %s.",
+                        replaced,
+                        excel_path.name,
+                    )
+                df = df[keep_mask].copy()
         df = pd.concat([df, new_df], ignore_index=True)
 
     # Same agreement + same filename base + revision markers → keep latest revision only
@@ -312,7 +337,7 @@ def _run_extraction(stop_check: Optional[Callable[[], bool]] = None, force_repro
         try:
             pdf_bytes = download_file_bytes(it["id"], drive_id=drive_id)
             size_kb = len(pdf_bytes) / 1024
-            logger.info("[%s] Downloaded %s (%.1f KB). Extracting fields (RAG)...", idx, short_name, size_kb)
+            logger.info("[%s] Downloaded %s (%.1f KB). Extracting fields (single-shot)...", idx, short_name, size_kb)
             rows = process_pdf_bytes(pdf_bytes, folder_name=folder_name, file_name=short_name)
             # process_pdf_bytes now returns a list of row dicts (multi-row for multi-table invoices)
             first_row = rows[0] if rows else {}
@@ -827,11 +852,25 @@ async def debug_pdf_list_problems():
     return results
 
 
+@app.get("/api/ui-version")
+async def ui_version():
+    """Debug: confirm this process serves the v2 dashboard and root ai_processor extraction."""
+    return {
+        "dashboard": "v2",
+        "extraction_module": "ai_processor (single-shot)",
+        "hint": "Single root ai_processor.py. Open GET / and look for 'UI v2'.",
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def read_index():
     """Serve production-style dashboard UI."""
     return HTMLResponse(
         media_type="text/html; charset=utf-8",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
         content="""
 <!doctype html>
 <html lang="en">
@@ -855,6 +894,7 @@ async def read_index():
       <div>
         <h1 class="text-2xl md:text-3xl font-bold">SOW &amp; Invoice Extraction Intelligence</h1>
         <p class="text-sm text-slate-600 mt-1">Production dashboard for SharePoint document processing.</p>
+        <p class="text-xs text-indigo-700 font-semibold mt-1" id="uiBuildMarker">UI v2 · single-shot extraction · manual refresh only</p>
       </div>
       <div id="systemBadge" class="inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm font-medium bg-emerald-100 text-emerald-700">
         <span class="w-2 h-2 rounded-full bg-emerald-500"></span>

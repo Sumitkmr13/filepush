@@ -12,10 +12,8 @@ for SOW documents or single-table invoices it returns a single object.
 import json
 import re
 import logging
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from config import (
     FIELDS,
@@ -196,8 +194,10 @@ Field definitions for invoices:
   "Contract Type": e.g. Addendum / Subscription, Perpetual, Service / PO
   "Billing Frequency": e.g. Annual, One-time, Project-based
   "Currency": 3-letter code (USD, EUR, RUB) or symbol ($, €)
-  "Start Date": contract start date exactly as printed in the document (original format); parent-level dates apply to the whole agreement
-  "End Date": contract end date exactly as printed in the document (original format)
+  "Start Date": contract start date exactly as printed in the document (original format); parent-level dates apply to the whole agreement.
+                If date labels are "Order Date"/"PO Date", map that value to "Start Date".
+  "End Date": contract end date exactly as printed in the document (original format).
+              If date labels are "Delivery Date"/"Due Date", map that value to "End Date".
   "Products / Modules": comma-separated product/module/SKU names for this table entry
   "TCV": total monetary value for this table entry (e.g. "$97,000")
   "Annual Value": per-year amount when applicable — use stated annual/yearly fee if printed; if only multi-year TCV and term length in years is clear (from dates or text), compute TCV divided by full years (e.g. $30,000 TCV over 3 years → "$10,000"); for a one-year term annual may equal TCV; null if not derivable
@@ -287,6 +287,83 @@ def _safe_str(val: Any) -> str:
     return s
 
 
+def _first_non_empty(source: Dict[str, Any], keys: List[str]) -> str:
+    for k in keys:
+        v = _safe_str(source.get(k))
+        if v:
+            return v
+    return ""
+
+
+def _parse_amount_number(value: str) -> Optional[float]:
+    if not value:
+        return None
+    cleaned = re.sub(r"[^\d.,]", "", value)
+    if not cleaned:
+        return None
+    # Handle both 1,234.56 and 1.234,56 style inputs.
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        parts = cleaned.split(",")
+        if len(parts[-1]) in (0, 3):
+            cleaned = cleaned.replace(",", "")
+        else:
+            cleaned = cleaned.replace(",", ".")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _extract_currency_prefix(value: str) -> str:
+    m = re.search(r"(USD|EUR|GBP|INR|AUD|CAD|SGD|JPY|CNY|RUB|CHF|SEK|NOK|DKK|AED|\$|€|£|¥|₹)", value or "", re.IGNORECASE)
+    return (m.group(1).upper() if m else "")
+
+
+def _parse_date(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    s = str(value).strip()
+    formats = (
+        "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%d-%m-%Y", "%m-%d-%Y",
+        "%Y/%m/%d", "%d.%m.%Y", "%m.%d.%Y", "%d %b %Y", "%d %B %Y",
+        "%b %d, %Y", "%B %d, %Y",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _derive_annual_value(tcv: str, start_date: str, end_date: str, billing_frequency: str) -> str:
+    amount = _parse_amount_number(tcv)
+    if amount is None or amount <= 0:
+        return ""
+    currency = _extract_currency_prefix(tcv)
+    freq = (billing_frequency or "").strip().lower()
+    if "annual" in freq or "year" in freq:
+        annual = amount
+    else:
+        start = _parse_date(start_date)
+        end = _parse_date(end_date)
+        if not start or not end or end <= start:
+            return ""
+        years = (end - start).days / 365.25
+        # Only derive when the term looks clearly year-based.
+        rounded_years = round(years)
+        if rounded_years < 1 or abs(years - rounded_years) > 0.2:
+            return ""
+        annual = amount / rounded_years
+    formatted = f"{annual:,.0f}"
+    return f"{currency} {formatted}".strip() if currency else formatted
+
+
 def _parse_extraction_response(
     raw_json: str,
     detected_language: str,
@@ -310,7 +387,12 @@ def _parse_extraction_response(
     if is_invoice:
         parent = data.get("parent") or {}
         for f in INVOICE_PARENT_FIELDS:
-            base[f] = _safe_str(parent.get(f))
+            if f == "Start Date":
+                base[f] = _first_non_empty(parent, ["Start Date", "start_date", "Order Date", "order_date", "PO Date", "po_date"])
+            elif f == "End Date":
+                base[f] = _first_non_empty(parent, ["End Date", "end_date", "Delivery Date", "delivery_date", "Due Date", "due_date"])
+            else:
+                base[f] = _safe_str(parent.get(f))
 
         # SOW-only fields are empty for invoices
         for f in ("Contract Name", "Commercial Value", "Owner/Contact"):
@@ -329,6 +411,13 @@ def _parse_extraction_response(
                 v = _safe_str(item.get(f))
                 if not v and f == "Annual Value":
                     v = _safe_str(item.get("annual_value"))
+                if not v and f == "Annual Value":
+                    v = _derive_annual_value(
+                        tcv=_safe_str(item.get("TCV")) or _safe_str(item.get("tcv")),
+                        start_date=base.get("Start Date", ""),
+                        end_date=base.get("End Date", ""),
+                        billing_frequency=base.get("Billing Frequency", ""),
+                    )
                 row[f] = v
             rows.append(row)
 
@@ -354,7 +443,10 @@ def _parse_extraction_response(
     # Dates might live in fields_data too
     for f in ("Start Date", "End Date"):
         if not base.get(f):
-            base[f] = _safe_str(fields_data.get(f))
+            if f == "Start Date":
+                base[f] = _first_non_empty(fields_data, ["Start Date", "start_date", "Order Date", "order_date", "PO Date", "po_date"])
+            else:
+                base[f] = _first_non_empty(fields_data, ["End Date", "end_date", "Delivery Date", "delivery_date", "Due Date", "due_date"])
 
     logger.info(
         "  [extract] %s: SOW Document, Contract Name=%s",

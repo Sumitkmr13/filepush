@@ -24,13 +24,19 @@ def clean_date(value: str) -> str:
 
 
 def clean_amount(value: str) -> str:
-    """Normalize amounts into $###,### format; leave unchanged if not parseable."""
+    """Normalize amount formatting while preserving explicit currency text/symbols."""
     if not isinstance(value, str) or not value.strip():
         return value
+    raw = value.strip()
+    has_currency_code = bool(re.search(r"\b[A-Z]{3}\b", raw))
+    if has_currency_code:
+        return raw
+    prefix_match = re.search(r"(\$|€|£|¥|₹|AUD|CAD|USD|EUR|GBP|INR|JPY|CNY|RUB)", raw, flags=re.IGNORECASE)
+    prefix = (prefix_match.group(1).upper() if prefix_match else "$")
     cleaned = re.sub(r"[^\d.,]", "", value)
     try:
         num = float(cleaned.replace(",", ""))
-        return f"${num:,.0f}"
+        return f"{prefix}{num:,.0f}" if prefix in {"$", "€", "£", "¥", "₹"} else f"{prefix} {num:,.0f}"
     except Exception:
         return value
 
