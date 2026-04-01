@@ -830,7 +830,9 @@ async def debug_pdf_list_problems():
 @app.get("/", response_class=HTMLResponse)
 async def read_index():
     """Serve production-style dashboard UI."""
-    return HTMLResponse(content="""
+    return HTMLResponse(
+        media_type="text/html; charset=utf-8",
+        content="""
 <!doctype html>
 <html lang="en">
 <head>
@@ -838,8 +840,16 @@ async def read_index():
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SOW & Invoice Extraction Intelligence</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* Fallback when Tailwind CDN is blocked (e.g. corporate VDI) */
+    html, body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: #f8fafc; color: #0f172a; }
+    a { color: #1e40af; }
+    .fallback-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 0.75rem; padding: 1rem; box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+    #activityLog { background: #0f172a !important; color: #e2e8f0 !important; }
+    #statusBox { background: #f1f5f9 !important; color: #0f172a !important; border: 1px solid #e2e8f0; }
+  </style>
 </head>
-<body class="bg-slate-50 text-slate-900">
+<body class="bg-slate-50 text-slate-900" style="background:#f8fafc;color:#0f172a;">
   <div class="max-w-7xl mx-auto px-4 py-6">
     <header class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
       <div>
@@ -957,7 +967,7 @@ async def read_index():
     function buildUrl(path) {
       const base = (document.getElementById("apiBase").value || "").trim();
       if (!base) return path;
-      return base.replace(/\\/$/, "") + path;
+      return base.replace(/\\/+$/, "") + path;
     }
 
     function showToast(msg, type) {
@@ -1038,7 +1048,7 @@ async def read_index():
         `Stop requested: ${stop}`,
         `Total rows in output excel(s): ${data.total_in_excel || 0}`,
         `Last error: ${err}`,
-      ].join("\\n");
+      ].join(String.fromCharCode(10));
     }
 
     async function refreshStatus() {
@@ -1148,11 +1158,16 @@ async def read_index():
     }
 
     async function refreshAll() {
-      await Promise.all([
-        refreshStatus(),
-        refreshStateCards(),
-        refreshDownloads(),
-      ]);
+      try {
+        await Promise.all([
+          refreshStatus(),
+          refreshStateCards(),
+          refreshDownloads(),
+        ]);
+      } catch (e) {
+        console.error(e);
+        showToast("Refresh failed: " + (e && e.message ? e.message : String(e)), "error");
+      }
     }
 
     refreshAll();
