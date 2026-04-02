@@ -206,9 +206,22 @@ Field definitions for invoices — PARENT (document-level):
   "Contract Type": e.g. Addendum / Subscription, Perpetual, Service / PO
   "Billing Frequency": e.g. Annual, One-time, Project-based
   "Currency": 3-letter code (USD, EUR, RUB) or symbol ($, €)
-  "Start Date": the main document-level start date. Look for: Start Date, Order Date, PO Date, Agreement Date,
-                Invoice Date, B/L Date, Shipment Date, Document Date.
+  "Start Date": the document-level start/issue date. This field is MANDATORY — try hard to populate it.
+                Look for these synonyms: Start Date, Order Date, PO Date, Agreement Date, Effective Date,
+                Commencement Date, Invoice Date, Issue Date, B/L Date, Shipment Date, Document Date,
+                Contract Date, Date of Issue, Issued On, Created Date.
+                IMPORTANT — how to derive Start Date:
+                  1. If an explicit start date, effective date, or commencement date is printed → use it directly.
+                  2. If no explicit start date but other dates exist, use the EARLIEST available date among:
+                     PO Date / Order Date / Invoice Date / Issue Date / Document Date / Agreement Date / B/L Date.
+                     These all represent when the agreement/transaction was initiated.
+                  3. For subscription/license contracts: look for "Effective Date", "Term Start", "License Start".
+                  4. If a date range is stated (e.g. "01/01/2024 – 12/31/2024"), the first date is the Start Date.
+                  5. If only a month/year is given (e.g. "January 2024"), use the first day (01/01/2024).
+                  6. If the document has an order confirmation date and no other start date, use it.
+                  7. If no date can be determined at all, set to null.
                 Copy exactly as printed (original format). This is the default date for all line items.
+                Never leave Start Date empty if any issue/order/effective date exists in the document.
   "End Date": the document-level end/due date. This field is MANDATORY — try hard to populate it.
               Look for these synonyms: End Date, Due Date, Deadline Payments, Invoice Due Date, Payment Due,
               Expiration Date, Maturity Date, Contract End Date, Delivery Date.
@@ -249,8 +262,12 @@ Field definitions for invoices — LINE ITEMS (per row in the pricing table):
       - If billing is One-time and term spans N years: Annual Value = TCV / N.
       - If it cannot be determined: null.
   "Pricing Model": e.g. Fixed, Per Unit, Hybrid (Fixed + User), Paid Up
-  "Start Date": date for this specific line item. If the line item has its own start/order date, use it.
-                Otherwise, copy the parent-level Start Date. Must not be null if parent has a date.
+  "Start Date": start/issue date for this specific line item. Populate as follows:
+                1. If the line item has its own start date, effective date, or order date printed → use it.
+                2. If the line item has a subscription/license period start (e.g. "License period: 01/01/2024 – 12/31/2024"),
+                   use the first date of that range.
+                3. Otherwise, copy the parent-level Start Date.
+                Must not be null if parent has a Start Date — always fall back to parent.
   "End Date": end/delivery/due date for this specific line item. Populate as follows:
               1. If the line item has its own delivery or end date (e.g. "Delivery date: 01/26/2023" printed
                  below the row), use that specific date.
@@ -282,7 +299,9 @@ Field definitions for SOW:
   "Vendor": supplier / services provider / counterparty legal name if shown (otherwise null)
   "Contract Name": formal contract or Statement of Work title
   "Start Date": contract start date exactly as printed in the document (original format).
-                Look for: Start Date, Effective Date, Commencement Date, Agreement Date.
+                Look for: Start Date, Effective Date, Commencement Date, Agreement Date, Contract Date,
+                Date of Issue, Execution Date. If a date range is stated, use the first date.
+                If only month/year is given, use the first day of that month. Never leave empty if derivable.
   "End Date": contract end date exactly as printed in the document (original format).
               Look for: End Date, Expiration Date, Termination Date, Due Date, Deadline, Completion Date.
               If only a duration is stated (e.g. "12 months from start"), compute the end date from Start Date.
@@ -481,9 +500,22 @@ def _parse_extraction_response(
         for f in INVOICE_PARENT_FIELDS:
             base[f] = _safe_str(parent.get(f))
 
-        # Parent-level dates serve as fallback for line items that lack their own dates.
-        parent_start = _first_non_empty(parent, ["Start Date", "start_date", "Order Date", "order_date", "PO Date", "po_date"])
-        parent_end = _first_non_empty(parent, ["End Date", "end_date", "Delivery Date", "delivery_date", "Due Date", "due_date"])
+        _START_KEYS = [
+            "Start Date", "start_date", "Order Date", "order_date", "PO Date", "po_date",
+            "Effective Date", "effective_date", "Invoice Date", "invoice_date",
+            "Issue Date", "issue_date", "Agreement Date", "agreement_date",
+            "Commencement Date", "commencement_date", "Contract Date", "contract_date",
+            "Date of Issue", "date_of_issue", "B/L Date", "bl_date",
+        ]
+        _END_KEYS = [
+            "End Date", "end_date", "Due Date", "due_date", "Delivery Date", "delivery_date",
+            "Expiration Date", "expiration_date", "Maturity Date", "maturity_date",
+            "Invoice Due Date", "invoice_due_date", "Payment Due", "payment_due",
+            "Deadline", "deadline", "Termination Date", "termination_date",
+            "Completion Date", "completion_date",
+        ]
+        parent_start = _first_non_empty(parent, _START_KEYS)
+        parent_end = _first_non_empty(parent, _END_KEYS)
 
         for f in ("Contract Name", "Commercial Value", "Owner/Contact"):
             base[f] = ""
@@ -499,11 +531,11 @@ def _parse_extraction_response(
             row = dict(base)
             for f in INVOICE_LINE_FIELDS:
                 if f == "Start Date":
-                    v = _first_non_empty(item, ["Start Date", "start_date", "Order Date", "order_date", "PO Date", "po_date"])
+                    v = _first_non_empty(item, _START_KEYS)
                     if not v:
                         v = parent_start
                 elif f == "End Date":
-                    v = _first_non_empty(item, ["End Date", "end_date", "Delivery Date", "delivery_date", "Due Date", "due_date"])
+                    v = _first_non_empty(item, _END_KEYS)
                     if not v:
                         v = parent_end
                 elif f == "Quantity":
@@ -525,6 +557,7 @@ def _parse_extraction_response(
                     end_date=row.get("End Date", ""),
                     billing_frequency=base.get("Billing Frequency", ""),
                 )
+            _fix_swapped_dates(row)
             rows.append(row)
 
         logger.info(
@@ -546,19 +579,44 @@ def _parse_extraction_response(
         if f not in base:
             base[f] = ""
 
-    # Dates might live in fields_data too
+    _SOW_START_KEYS = [
+        "Start Date", "start_date", "Effective Date", "effective_date",
+        "Commencement Date", "commencement_date", "Agreement Date", "agreement_date",
+        "Contract Date", "contract_date", "Execution Date", "execution_date",
+        "Date of Issue", "date_of_issue",
+    ]
+    _SOW_END_KEYS = [
+        "End Date", "end_date", "Expiration Date", "expiration_date",
+        "Termination Date", "termination_date", "Completion Date", "completion_date",
+        "Due Date", "due_date", "Deadline", "deadline",
+    ]
     for f in ("Start Date", "End Date"):
         if not base.get(f):
-            if f == "Start Date":
-                base[f] = _first_non_empty(fields_data, ["Start Date", "start_date", "Order Date", "order_date", "PO Date", "po_date"])
-            else:
-                base[f] = _first_non_empty(fields_data, ["End Date", "end_date", "Delivery Date", "delivery_date", "Due Date", "due_date"])
+            base[f] = _first_non_empty(fields_data, _SOW_START_KEYS if f == "Start Date" else _SOW_END_KEYS)
 
+    _fix_swapped_dates(base)
     logger.info(
         "  [extract] %s: SOW Document, Contract Name=%s",
         file_name, base.get("Contract Name", "")[:50],
     )
     return [base]
+
+
+def _fix_swapped_dates(row: Dict[str, str]) -> None:
+    """If Start Date is later than End Date, swap them. Modifies row in place."""
+    s = row.get("Start Date", "")
+    e = row.get("End Date", "")
+    if not s or not e:
+        return
+    start = _parse_date(s)
+    end = _parse_date(e)
+    if start and end and start > end:
+        logger.warning(
+            "  [dates] Start Date (%s) > End Date (%s) — swapping for %s",
+            s, e, row.get("Filename", ""),
+        )
+        row["Start Date"] = e
+        row["End Date"] = s
 
 
 # ---------------------------------------------------------------------------
