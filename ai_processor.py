@@ -206,23 +206,31 @@ Field definitions for invoices — PARENT (document-level):
   "Contract Type": e.g. Addendum / Subscription, Perpetual, Service / PO
   "Billing Frequency": e.g. Annual, One-time, Project-based
   "Currency": 3-letter code (USD, EUR, RUB) or symbol ($, €)
-  "Start Date": the document-level start/issue date. This field is MANDATORY — try hard to populate it.
+  "Start Date": the document-level start/issue date. IMPORTANT — try hard to populate it, but use null
+                if genuinely no date can be found or derived.
                 Look for these synonyms: Start Date, Order Date, PO Date, Agreement Date, Effective Date,
                 Commencement Date, Invoice Date, Issue Date, B/L Date, Shipment Date, Document Date,
                 Contract Date, Date of Issue, Issued On, Created Date.
+                ALSO look for dates embedded in reference/context lines such as:
+                  "Ref: Statement of Work dated March 27, 2017"
+                  "Statement of Work/Change Order dated July 25, 2017"
+                  "Per agreement dated 01/15/2020"
+                  "As per contract signed on December 1, 2019"
+                When multiple reference dates exist, use the LATEST one (the most recent agreement/change order).
                 IMPORTANT — how to derive Start Date:
                   1. If an explicit start date, effective date, or commencement date is printed → use it directly.
-                  2. If no explicit start date but other dates exist, use the EARLIEST available date among:
+                  2. If reference lines mention dated agreements/change orders (e.g. "Change Order dated July 25, 2017"),
+                     use the latest such date as Start Date — it represents the most recent governing document.
+                  3. If no explicit start date but other dates exist, use the EARLIEST available date among:
                      PO Date / Order Date / Invoice Date / Issue Date / Document Date / Agreement Date / B/L Date.
-                     These all represent when the agreement/transaction was initiated.
-                  3. For subscription/license contracts: look for "Effective Date", "Term Start", "License Start".
-                  4. If a date range is stated (e.g. "01/01/2024 – 12/31/2024"), the first date is the Start Date.
-                  5. If only a month/year is given (e.g. "January 2024"), use the first day (01/01/2024).
-                  6. If the document has an order confirmation date and no other start date, use it.
-                  7. If no date can be determined at all, set to null.
+                  4. For subscription/license contracts: look for "Effective Date", "Term Start", "License Start".
+                  5. If a date range is stated (e.g. "01/01/2024 – 12/31/2024"), the first date is the Start Date.
+                  6. If only a month/year is given (e.g. "January 2024"), use the first day (01/01/2024).
+                  7. If the document has an order confirmation date and no other start date, use it.
+                  8. If no date can be determined at all, set to null.
                 Copy exactly as printed (original format). This is the default date for all line items.
-                Never leave Start Date empty if any issue/order/effective date exists in the document.
-  "End Date": the document-level end/due date. This field is MANDATORY — try hard to populate it.
+  "End Date": the document-level end/due date. IMPORTANT — try hard to populate it, but use null
+              if genuinely no end date, due date, or payment terms can be found.
               Look for these synonyms: End Date, Due Date, Deadline Payments, Invoice Due Date, Payment Due,
               Expiration Date, Maturity Date, Contract End Date, Delivery Date.
               IMPORTANT — how to derive End Date when not explicitly stated:
@@ -300,12 +308,14 @@ Field definitions for SOW:
   "Contract Name": formal contract or Statement of Work title
   "Start Date": contract start date exactly as printed in the document (original format).
                 Look for: Start Date, Effective Date, Commencement Date, Agreement Date, Contract Date,
-                Date of Issue, Execution Date. If a date range is stated, use the first date.
-                If only month/year is given, use the first day of that month. Never leave empty if derivable.
+                Date of Issue, Execution Date. Also check reference lines like "Statement of Work dated March 27, 2017"
+                or "Change Order dated July 25, 2017" — use the latest referenced date.
+                If a date range is stated, use the first date. If only month/year, use the first day of that month.
+                Use null if genuinely not present.
   "End Date": contract end date exactly as printed in the document (original format).
               Look for: End Date, Expiration Date, Termination Date, Due Date, Deadline, Completion Date.
               If only a duration is stated (e.g. "12 months from start"), compute the end date from Start Date.
-              If only month/year is given, use the last day of that month. Never leave empty if derivable.
+              If only month/year is given, use the last day of that month. Use null if genuinely not present.
   "Commercial Value": total contract value (amount only)
   "Currency": 3-letter code or symbol
   "Owner/Contact": primary owner or contact name
