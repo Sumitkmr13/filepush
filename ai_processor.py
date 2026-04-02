@@ -206,10 +206,26 @@ Field definitions for invoices — PARENT (document-level):
   "Contract Type": e.g. Addendum / Subscription, Perpetual, Service / PO
   "Billing Frequency": e.g. Annual, One-time, Project-based
   "Currency": 3-letter code (USD, EUR, RUB) or symbol ($, €)
-  "Start Date": the main document-level start date. Look for: Start Date, Order Date, PO Date, Agreement Date.
+  "Start Date": the main document-level start date. Look for: Start Date, Order Date, PO Date, Agreement Date,
+                Invoice Date, B/L Date, Shipment Date, Document Date.
                 Copy exactly as printed (original format). This is the default date for all line items.
-  "End Date": the main document-level end date. Look for: End Date, Expiration Date, Due Date.
-              Copy exactly as printed (original format). null if not present at document level.
+  "End Date": the document-level end/due date. This field is MANDATORY — try hard to populate it.
+              Look for these synonyms: End Date, Due Date, Deadline Payments, Invoice Due Date, Payment Due,
+              Expiration Date, Maturity Date, Contract End Date, Delivery Date.
+              IMPORTANT — how to derive End Date when not explicitly stated:
+                1. If an explicit due date, contract end date, or expiration date is printed → use it directly.
+                2. If payment terms state a single condition (e.g. "Net 30", "60 Days Net", "Payment within 90 days"):
+                   take the LATEST available date among Start Date / PO Date / Invoice Date / Shipment Date /
+                   Delivery Date / B/L Date, then add the stated number of days. Example: PO Date 07/19/2022,
+                   terms "Net 30" → End Date = 08/18/2022.
+                3. For "at sight" or "LC at sight": add 25 days to the latest available date.
+                4. For "EOM" / "End of Month" terms (e.g. "60 days End of Month"): advance the base date to the
+                   last day of that month, then add the stated days.
+                5. For "X days after B/L date": use B/L date if present; otherwise use the latest of
+                   Shipment Date / Delivery Date / Invoice Date as base, then add X days.
+                6. If only a month/year is given (e.g. "March 2024"), use the last day of that month (03/31/2024).
+                7. If payment terms exist but no calculation is possible, set to null.
+                Never leave End Date empty if any due date, delivery date, or payment terms exist in the document.
 
 Field definitions for invoices — LINE ITEMS (per row in the pricing table):
   "Products / Modules": product name, material description, or SKU for this line
@@ -235,15 +251,25 @@ Field definitions for invoices — LINE ITEMS (per row in the pricing table):
   "Pricing Model": e.g. Fixed, Per Unit, Hybrid (Fixed + User), Paid Up
   "Start Date": date for this specific line item. If the line item has its own start/order date, use it.
                 Otherwise, copy the parent-level Start Date. Must not be null if parent has a date.
-  "End Date": end/delivery date for this specific line item. If the line item has its own delivery/end date
-              (e.g. "Delivery date: 01/26/2023" printed below the row), use that.
-              Otherwise, copy the parent-level End Date (or null if parent also has none).
+  "End Date": end/delivery/due date for this specific line item. Populate as follows:
+              1. If the line item has its own delivery or end date (e.g. "Delivery date: 01/26/2023" printed
+                 below the row), use that specific date.
+              2. If the line item has payment terms specific to it, derive end date using the same logic as
+                 the parent End Date (Net X days, EOM, at sight, etc.) from the line item's own dates.
+              3. Otherwise, copy the parent-level End Date.
+              4. If a document has "PAYMENT TERMS: NET 30 DAYS" at document level and a line item has
+                 "Delivery date: 01/26/2023", the line item's End Date should be the delivery date (01/26/2023),
+                 NOT the payment terms calculation — delivery date takes priority for line items.
+              Never leave blank if a delivery date or parent End Date exists.
 
 IMPORTANT for dates:
-  - ALWAYS include Start Date and End Date in the "parent" object if any document-level date exists.
-  - Purchase orders: "PO Date" at the top → parent "Start Date"; per-line "Delivery date:" → that line's "End Date".
-  - Subscription contracts: "Start Date" / "End Date" at document level → parent dates + copy to each line item.
-  - Always copy the date exactly as it appears in the document. Do not reformat.
+  - ALWAYS include Start Date and End Date in the "parent" object. Try every derivation method above before using null.
+  - Purchase orders: "PO Date" at top → parent "Start Date"; "PAYMENT TERMS: NET 30 DAYS" → derive parent "End Date";
+    per-line "Delivery date:" → that specific line item's "End Date".
+  - Subscription/license contracts: "Start Date" / "End Date" at document level → parent dates + copy to each line item.
+  - Do NOT confuse shipment/delivery schedules with payment term schedules. If the document shows multiple
+    shipments but a single payment term, use the single payment term for the parent End Date.
+  - Always copy dates exactly as they appear in the document. Do not reformat.
 
 If a document has THREE line items in the table, "line_items" MUST have three objects — one per row.
 
@@ -255,8 +281,12 @@ Field definitions for SOW:
   "Contract ID": agreement or reference ID if shown (otherwise null)
   "Vendor": supplier / services provider / counterparty legal name if shown (otherwise null)
   "Contract Name": formal contract or Statement of Work title
-  "Start Date": contract start date exactly as printed in the document (original format)
-  "End Date": contract end date exactly as printed in the document (original format)
+  "Start Date": contract start date exactly as printed in the document (original format).
+                Look for: Start Date, Effective Date, Commencement Date, Agreement Date.
+  "End Date": contract end date exactly as printed in the document (original format).
+              Look for: End Date, Expiration Date, Termination Date, Due Date, Deadline, Completion Date.
+              If only a duration is stated (e.g. "12 months from start"), compute the end date from Start Date.
+              If only month/year is given, use the last day of that month. Never leave empty if derivable.
   "Commercial Value": total contract value (amount only)
   "Currency": 3-letter code or symbol
   "Owner/Contact": primary owner or contact name
