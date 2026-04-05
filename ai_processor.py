@@ -206,6 +206,9 @@ Field definitions for invoices — PARENT (document-level):
   "Contract Type": e.g. Addendum / Subscription, Perpetual, Service / PO
   "Billing Frequency": e.g. Annual, One-time, Project-based
   "Currency": 3-letter code (USD, EUR, RUB) or symbol ($, €)
+  For purchase orders and license invoices: always include a "PO Date" field in the parent object when the
+  document shows a PO date / order date (e.g. header "PO Date: MM/DD/YYYY"), even if Start Date and End Date
+  are empty — downstream logic may use PO Date as Start Date when no other dates were extracted.
   "Start Date": the document-level start/issue date. IMPORTANT — try hard to populate it, but use null
                 if genuinely no date can be found or derived.
                 Look for these synonyms: Start Date, Order Date, PO Date, Agreement Date, Effective Date,
@@ -526,6 +529,10 @@ def _parse_extraction_response(
         ]
         parent_start = _first_non_empty(parent, _START_KEYS)
         parent_end = _first_non_empty(parent, _END_KEYS)
+        _PO_DATE_FALLBACK_KEYS = [
+            "PO Date", "po_date", "PO date", "Order Date", "order_date",
+            "Purchase Order Date", "purchase_order_date", "P.O. Date", "p.o._date",
+        ]
 
         for f in ("Contract Name", "Commercial Value", "Owner/Contact"):
             base[f] = ""
@@ -567,6 +574,19 @@ def _parse_extraction_response(
                     end_date=row.get("End Date", ""),
                     billing_frequency=base.get("Billing Frequency", ""),
                 )
+            if (
+                not _normalize_field_value(str(row.get("Start Date", "") or ""))
+                and not _normalize_field_value(str(row.get("End Date", "") or ""))
+            ):
+                po_only = _first_non_empty(parent, _PO_DATE_FALLBACK_KEYS) or _first_non_empty(
+                    data, _PO_DATE_FALLBACK_KEYS
+                )
+                if po_only:
+                    row["Start Date"] = po_only
+                    row["End Date"] = ""
+                    row["Description"] = (
+                        "No start or end dates were extracted; PO date is used as Start Date."
+                    )
             _fix_swapped_dates(row)
             rows.append(row)
 
