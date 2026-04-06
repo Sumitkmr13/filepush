@@ -209,47 +209,36 @@ Field definitions for invoices — PARENT (document-level):
   For purchase orders and license invoices: always include a "PO Date" field in the parent object when the
   document shows a PO date / order date (e.g. header "PO Date: MM/DD/YYYY"), even if Start Date and End Date
   are empty — downstream logic may use PO Date as Start Date when no other dates were extracted.
-  "Start Date": the document-level start/issue date. IMPORTANT — try hard to populate it, but use null
-                if genuinely no date can be found or derived.
-                Look for these synonyms: Start Date, Order Date, PO Date, Agreement Date, Effective Date,
-                Commencement Date, Invoice Date, Issue Date, B/L Date, Shipment Date, Document Date,
-                Contract Date, Date of Issue, Issued On, Created Date.
-                ALSO look for dates embedded in reference/context lines such as:
+  "Start Date": the document-level start/issue date. IMPORTANT — only when clearly supported by the text;
+                use null if none exists.
+                For License Invoice / purchase orders: PRIORITIZE "PO Date" and "Order Date" when they appear
+                labeled on the document (header/footer) — use them as Start Date when there is no clearer
+                "Start Date" / "Effective Date" / "Commencement Date".
+                Also look for: Start Date, Agreement Date, Effective Date, Commencement Date, Invoice Date,
+                Issue Date, B/L Date, Shipment Date, Document Date, Contract Date, Date of Issue, Issued On.
+                ALSO look for dates embedded in reference lines such as:
                   "Ref: Statement of Work dated March 27, 2017"
                   "Statement of Work/Change Order dated July 25, 2017"
-                  "Per agreement dated 01/15/2020"
-                  "As per contract signed on December 1, 2019"
-                When multiple reference dates exist, use the LATEST one (the most recent agreement/change order).
-                IMPORTANT — how to derive Start Date:
-                  1. If an explicit start date, effective date, or commencement date is printed → use it directly.
-                  2. If reference lines mention dated agreements/change orders (e.g. "Change Order dated July 25, 2017"),
-                     use the latest such date as Start Date — it represents the most recent governing document.
-                  3. If no explicit start date but other dates exist, use the EARLIEST available date among:
-                     PO Date / Order Date / Invoice Date / Issue Date / Document Date / Agreement Date / B/L Date.
-                  4. For subscription/license contracts: look for "Effective Date", "Term Start", "License Start".
-                  5. If a date range is stated (e.g. "01/01/2024 – 12/31/2024"), the first date is the Start Date.
-                  6. If only a month/year is given (e.g. "January 2024"), use the first day (01/01/2024).
-                  7. If the document has an order confirmation date and no other start date, use it.
-                  8. If no date can be determined at all, set to null.
+                When multiple reference dates exist, use the LATEST one (most recent agreement/change order).
+                How to set Start Date:
+                  1. Explicit start / effective / commencement date printed → use it directly.
+                  2. Reference lines with dated agreements/change orders → use the latest such date.
+                  3. PO/license forms: prefer PO Date or Order Date when shown and no better start date exists.
+                  4. Subscription/license: "Effective Date", "Term Start", "License Start" when labeled.
+                  5. A stated date range → first date is Start Date.
+                  6. Only month/year → first day of that month.
+                  7. Otherwise null.
                 Copy exactly as printed (original format). This is the default date for all line items.
-  "End Date": the document-level end/due date. IMPORTANT — try hard to populate it, but use null
-              if genuinely no end date, due date, or payment terms can be found.
-              Look for these synonyms: End Date, Due Date, Deadline Payments, Invoice Due Date, Payment Due,
-              Expiration Date, Maturity Date, Contract End Date, Delivery Date.
-              IMPORTANT — how to derive End Date when not explicitly stated:
-                1. If an explicit due date, contract end date, or expiration date is printed → use it directly.
-                2. If payment terms state a single condition (e.g. "Net 30", "60 Days Net", "Payment within 90 days"):
-                   take the LATEST available date among Start Date / PO Date / Invoice Date / Shipment Date /
-                   Delivery Date / B/L Date, then add the stated number of days. Example: PO Date 07/19/2022,
-                   terms "Net 30" → End Date = 08/18/2022.
-                3. For "at sight" or "LC at sight": add 25 days to the latest available date.
-                4. For "EOM" / "End of Month" terms (e.g. "60 days End of Month"): advance the base date to the
-                   last day of that month, then add the stated days.
-                5. For "X days after B/L date": use B/L date if present; otherwise use the latest of
-                   Shipment Date / Delivery Date / Invoice Date as base, then add X days.
-                6. If only a month/year is given (e.g. "March 2024"), use the last day of that month (03/31/2024).
-                7. If payment terms exist but no calculation is possible, set to null.
-                Never leave End Date empty if any due date, delivery date, or payment terms exist in the document.
+  "End Date": use ONLY when the document explicitly states an end, expiration, delivery completion, or term
+              end — or when a clear duration ties to a computable end (e.g. "24 months from effective date"
+              together with an explicit effective/start date). Use null if nothing qualifies.
+              ACCEPT: End Date, Expiration, Contract End, Term End, labeled Delivery Date (shipment/delivery),
+              "valid until …", explicit "Due Date:" only when that line is clearly the obligation/delivery end
+              (not payment timing inferred from "Net 30" alone).
+              DO NOT set End Date from payment terms alone: do NOT infer from "Net 30/60", "at sight", "EOM",
+              "X days after invoice", or similar unless the document prints an actual calendar date for that
+              obligation. If unsure, use null.
+              If only month/year for an explicit end, use last day of that month. Otherwise null.
 
 Field definitions for invoices — LINE ITEMS (per row in the pricing table):
   "Products / Modules": product name, material description, or SKU for this line
@@ -273,31 +262,24 @@ Field definitions for invoices — LINE ITEMS (per row in the pricing table):
       - If billing is One-time and term spans N years: Annual Value = TCV / N.
       - If it cannot be determined: null.
   "Pricing Model": e.g. Fixed, Per Unit, Hybrid (Fixed + User), Paid Up
-  "Start Date": start/issue date for this specific line item. Populate as follows:
-                1. If the line item has its own start date, effective date, or order date printed → use it.
-                2. If the line item has a subscription/license period start (e.g. "License period: 01/01/2024 – 12/31/2024"),
-                   use the first date of that range.
-                3. Otherwise, copy the parent-level Start Date.
-                Must not be null if parent has a Start Date — always fall back to parent.
-  "End Date": end/delivery/due date for this specific line item. Populate as follows:
-              1. If the line item has its own delivery or end date (e.g. "Delivery date: 01/26/2023" printed
-                 below the row), use that specific date.
-              2. If the line item has payment terms specific to it, derive end date using the same logic as
-                 the parent End Date (Net X days, EOM, at sight, etc.) from the line item's own dates.
-              3. Otherwise, copy the parent-level End Date.
-              4. If a document has "PAYMENT TERMS: NET 30 DAYS" at document level and a line item has
-                 "Delivery date: 01/26/2023", the line item's End Date should be the delivery date (01/26/2023),
-                 NOT the payment terms calculation — delivery date takes priority for line items.
-              Never leave blank if a delivery date or parent End Date exists.
+  "Start Date": start/issue date for this specific line item. Same priority as parent (must match downstream logic):
+                1. Service period / subscription or license term in the line or body (first date of a printed range).
+                2. Delivery / ship date when that is the operational start for this line.
+                3. PO Date / Order Date for license / PO rows (prefer when labeled on the line or parent header).
+                4. Invoice Date / Invoice Dt only when none of the above exist.
+                Use null when not printed; do not copy invoice date into Start Date unless it is the only dated anchor.
+  "End Date": line-level end or delivery date ONLY when explicitly printed for that row (e.g. "Delivery date:
+              01/26/2023" under the line) or when parent End Date is explicitly set from the document (not from
+              payment-term math). Do NOT derive End Date from Net 30 / at sight / EOM. Otherwise copy parent
+              End Date if parent has an explicit end; use null if none.
 
 IMPORTANT for dates:
-  - ALWAYS include Start Date and End Date in the "parent" object. Try every derivation method above before using null.
-  - Purchase orders: "PO Date" at top → parent "Start Date"; "PAYMENT TERMS: NET 30 DAYS" → derive parent "End Date";
-    per-line "Delivery date:" → that specific line item's "End Date".
-  - Subscription/license contracts: "Start Date" / "End Date" at document level → parent dates + copy to each line item.
-  - Do NOT confuse shipment/delivery schedules with payment term schedules. If the document shows multiple
-    shipments but a single payment term, use the single payment term for the parent End Date.
-  - Always copy dates exactly as they appear in the document. Do not reformat.
+  - Include Start Date and End Date in "parent" only when supported by explicit text (or duration→end as above).
+  - License/PO: prefer PO Date / Order Date for parent Start Date when shown.
+  - Do NOT use payment terms (Net 30, etc.) to invent End Date.
+  - Per-line delivery/shipment completion date under a row → that line's End Date only when it is clearly a term/service end,
+    not payment due. Do not use "Due Date" for End Date when it is only payment timing.
+  - Always copy dates as printed in the document; do not reformat in JSON.
 
 If a document has THREE line items in the table, "line_items" MUST have three objects — one per row.
 
@@ -315,10 +297,10 @@ Field definitions for SOW:
                 or "Change Order dated July 25, 2017" — use the latest referenced date.
                 If a date range is stated, use the first date. If only month/year, use the first day of that month.
                 Use null if genuinely not present.
-  "End Date": contract end date exactly as printed in the document (original format).
-              Look for: End Date, Expiration Date, Termination Date, Due Date, Deadline, Completion Date.
-              If only a duration is stated (e.g. "12 months from start"), compute the end date from Start Date.
-              If only month/year is given, use the last day of that month. Use null if genuinely not present.
+  "End Date": contract end date only when explicitly stated or when a clear duration (e.g. "12 months from
+              effective date") allows computing end from an explicit Start Date. Do NOT infer End Date from
+              payment terms (Net 30, etc.). If only month/year for an explicit end, use last day of that month.
+              Use null if not present.
   "Commercial Value": total contract value (amount only)
   "Currency": 3-letter code or symbol
   "Owner/Contact": primary owner or contact name
@@ -488,6 +470,219 @@ def _derive_annual_value(tcv: str, start_date: str, end_date: str, billing_frequ
     return f"{currency} {formatted}".strip() if currency else formatted
 
 
+def _append_invoice_description(row: Dict[str, str], note: str) -> None:
+    if not note.strip():
+        return
+    existing = (row.get("Description") or "").strip()
+    if existing and note in existing:
+        return
+    row["Description"] = f"{existing} {note}".strip() if existing else note
+
+
+_INVOICE_DATE_KEYS_FOR_MATCH = [
+    "Invoice Date",
+    "invoice_date",
+    "Invoice Dt",
+    "invoice_dt",
+    "Date of Invoice",
+    "date_of_invoice",
+]
+_PO_DATE_KEYS_FOR_MATCH = [
+    "PO Date",
+    "po_date",
+    "PO date",
+    "Order Date",
+    "order_date",
+    "Purchase Order Date",
+    "purchase_order_date",
+    "P.O. Date",
+    "p.o._date",
+]
+
+# License invoice: do not map payment due / deadline labels to End Date (avoids payment timing as term end).
+_END_KEYS_LICENSE = [
+    "End Date",
+    "end_date",
+    "Expiration Date",
+    "expiration_date",
+    "Maturity Date",
+    "maturity_date",
+    "Termination Date",
+    "termination_date",
+    "Completion Date",
+    "completion_date",
+    "Delivery Date",
+    "delivery_date",
+]
+
+
+def _dates_equal_for_note(a: str, b: str) -> bool:
+    pa, pb = _parse_date(a), _parse_date(b)
+    if pa and pb:
+        return pa.date() == pb.date()
+    return _normalize_field_value(a) == _normalize_field_value(b)
+
+
+def _apply_invoice_start_description(
+    row: Dict[str, str],
+    start_tier: str,
+    start_val: str,
+    item: Dict[str, Any],
+    parent: Dict[str, Any],
+    data: Dict[str, Any],
+) -> None:
+    """Append Description notes when Start Date is derived from fallback tiers (not explicit service period)."""
+    if not start_val.strip():
+        return
+    po_val = (
+        _first_non_empty(item, _PO_DATE_KEYS_FOR_MATCH)
+        or _first_non_empty(parent, _PO_DATE_KEYS_FOR_MATCH)
+        or _first_non_empty(data, _PO_DATE_KEYS_FOR_MATCH)
+    )
+    inv_val = (
+        _first_non_empty(item, _INVOICE_DATE_KEYS_FOR_MATCH)
+        or _first_non_empty(parent, _INVOICE_DATE_KEYS_FOR_MATCH)
+        or _first_non_empty(data, _INVOICE_DATE_KEYS_FOR_MATCH)
+    )
+    if start_tier == "delivery":
+        _append_invoice_description(
+            row,
+            "Start date from delivery/ship date (no explicit service period start in the document).",
+        )
+    elif start_tier == "po":
+        _append_invoice_description(
+            row,
+            "Start date from PO/order date (no earlier service period or delivery date in the document).",
+        )
+    elif start_tier == "invoice":
+        _append_invoice_description(
+            row,
+            "Start date from invoice date (no service period, delivery, or PO date found in the document).",
+        )
+    elif start_tier == "labeled_start" and inv_val and not po_val and _dates_equal_for_note(start_val, inv_val):
+        _append_invoice_description(
+            row,
+            "Start date from invoice date (no service period or PO date; the Start Date field matched the invoice date).",
+        )
+
+
+def _best_start_date_license_invoice(
+    item: Dict[str, Any],
+    parent: Dict[str, Any],
+    data: Dict[str, Any],
+) -> Tuple[str, str]:
+    """
+    Agreed priority for License / PO rows:
+      1) Service period / explicit contract start (not generic Start Date before PO/invoice)
+      2) Delivery / ship date
+      3) PO / order date (before invoice for license docs)
+      4) Labeled Start Date / start_date (after PO so PO wins)
+      5) Invoice date (last resort)
+    Returns (value, tier_name) where tier_name is service|delivery|po|labeled_start|invoice|none.
+    """
+    tiers: List[Tuple[str, List[str]]] = [
+        (
+            "service",
+            [
+                "Service Start",
+                "service_start",
+                "Term Start",
+                "term_start",
+                "Period Start",
+                "period_start",
+                "Service Period Start",
+                "License Start",
+                "license_start",
+                "Effective Date",
+                "effective_date",
+                "Commencement Date",
+                "commencement_date",
+                "Agreement Date",
+                "agreement_date",
+                "Contract Start",
+                "contract_start",
+            ],
+        ),
+        (
+            "delivery",
+            [
+                "Delivery Date",
+                "delivery_date",
+                "Ship Date",
+                "ship_date",
+                "Expected Delivery",
+                "expected_delivery",
+            ],
+        ),
+        (
+            "po",
+            [
+                "PO Date",
+                "po_date",
+                "PO date",
+                "Order Date",
+                "order_date",
+                "Purchase Order Date",
+                "purchase_order_date",
+                "P.O. Date",
+                "p.o._date",
+            ],
+        ),
+        (
+            "labeled_start",
+            [
+                "Start Date",
+                "start_date",
+            ],
+        ),
+        (
+            "invoice",
+            [
+                "Invoice Date",
+                "invoice_date",
+                "Invoice Dt",
+                "invoice_dt",
+                "Date of Invoice",
+                "date_of_invoice",
+            ],
+        ),
+    ]
+    for tier_name, keys in tiers:
+        v = _first_non_empty(item, keys) or _first_non_empty(parent, keys) or _first_non_empty(data, keys)
+        if v:
+            return v, tier_name
+    return "", "none"
+
+
+def _clear_end_date_if_likely_net_payment_due(row: Dict[str, str], parent: Dict[str, Any]) -> None:
+    """
+    Do not keep an End Date that only reflects payment due timing (Net 30/60) when the document
+    does not state an explicit service/delivery end. Heuristic: Net X in billing + ~X days span.
+    """
+    billing = (
+        f"{row.get('Billing Frequency', '')} "
+        f"{_safe_str(parent.get('Payment Terms'))} "
+        f"{_safe_str(parent.get('payment_terms'))}"
+    )
+    if "net" not in billing.lower():
+        return
+    s_raw = row.get("Start Date", "")
+    e_raw = row.get("End Date", "")
+    if not s_raw or not e_raw:
+        return
+    s = _parse_date(s_raw)
+    e = _parse_date(e_raw)
+    if not s or not e or e <= s:
+        return
+    delta = (e - s).days
+    if (25 <= delta <= 35) or (55 <= delta <= 65):
+        row["End Date"] = ""
+        _append_invoice_description(
+            row,
+            "End date omitted: span matched payment terms (e.g. Net 30/60) but no explicit service end or delivery end date was stated.",
+        )
+
+
 def _parse_extraction_response(
     raw_json: str,
     detected_language: str,
@@ -513,26 +708,7 @@ def _parse_extraction_response(
         for f in INVOICE_PARENT_FIELDS:
             base[f] = _safe_str(parent.get(f))
 
-        _START_KEYS = [
-            "Start Date", "start_date", "Order Date", "order_date", "PO Date", "po_date",
-            "Effective Date", "effective_date", "Invoice Date", "invoice_date",
-            "Issue Date", "issue_date", "Agreement Date", "agreement_date",
-            "Commencement Date", "commencement_date", "Contract Date", "contract_date",
-            "Date of Issue", "date_of_issue", "B/L Date", "bl_date",
-        ]
-        _END_KEYS = [
-            "End Date", "end_date", "Due Date", "due_date", "Delivery Date", "delivery_date",
-            "Expiration Date", "expiration_date", "Maturity Date", "maturity_date",
-            "Invoice Due Date", "invoice_due_date", "Payment Due", "payment_due",
-            "Deadline", "deadline", "Termination Date", "termination_date",
-            "Completion Date", "completion_date",
-        ]
-        parent_start = _first_non_empty(parent, _START_KEYS)
-        parent_end = _first_non_empty(parent, _END_KEYS)
-        _PO_DATE_FALLBACK_KEYS = [
-            "PO Date", "po_date", "PO date", "Order Date", "order_date",
-            "Purchase Order Date", "purchase_order_date", "P.O. Date", "p.o._date",
-        ]
+        parent_end = _first_non_empty(parent, _END_KEYS_LICENSE)
 
         for f in ("Contract Name", "Commercial Value", "Owner/Contact"):
             base[f] = ""
@@ -546,13 +722,12 @@ def _parse_extraction_response(
         rows: List[Dict[str, str]] = []
         for item in line_items:
             row = dict(base)
+            start_val, start_tier = _best_start_date_license_invoice(item, parent, data)
             for f in INVOICE_LINE_FIELDS:
                 if f == "Start Date":
-                    v = _first_non_empty(item, _START_KEYS)
-                    if not v:
-                        v = parent_start
+                    v = start_val
                 elif f == "End Date":
-                    v = _first_non_empty(item, _END_KEYS)
+                    v = _first_non_empty(item, _END_KEYS_LICENSE)
                     if not v:
                         v = parent_end
                 elif f == "Quantity":
@@ -567,6 +742,8 @@ def _parse_extraction_response(
                     v = _safe_str(item.get(f))
                 row[f] = v
 
+            _apply_invoice_start_description(row, start_tier, start_val, item, parent, data)
+
             if not row.get("Annual Value"):
                 row["Annual Value"] = _derive_annual_value(
                     tcv=_safe_str(item.get("TCV")) or _safe_str(item.get("tcv")),
@@ -574,19 +751,7 @@ def _parse_extraction_response(
                     end_date=row.get("End Date", ""),
                     billing_frequency=base.get("Billing Frequency", ""),
                 )
-            if (
-                not _normalize_field_value(str(row.get("Start Date", "") or ""))
-                and not _normalize_field_value(str(row.get("End Date", "") or ""))
-            ):
-                po_only = _first_non_empty(parent, _PO_DATE_FALLBACK_KEYS) or _first_non_empty(
-                    data, _PO_DATE_FALLBACK_KEYS
-                )
-                if po_only:
-                    row["Start Date"] = po_only
-                    row["End Date"] = ""
-                    row["Description"] = (
-                        "No start or end dates were extracted; PO date is used as Start Date."
-                    )
+            _clear_end_date_if_likely_net_payment_due(row, parent)
             _fix_swapped_dates(row)
             rows.append(row)
 
