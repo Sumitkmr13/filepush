@@ -211,23 +211,22 @@ Field definitions for invoices — PARENT (document-level):
   are empty — downstream logic may use PO Date as Start Date when no other dates were extracted.
   "Start Date": the document-level start/issue date. IMPORTANT — only when clearly supported by the text;
                 use null if none exists.
-                For License Invoice / purchase orders: PRIORITIZE "PO Date" and "Order Date" when they appear
-                labeled on the document (header/footer) — use them as Start Date when there is no clearer
-                "Start Date" / "Effective Date" / "Commencement Date".
-                Also look for: Start Date, Agreement Date, Effective Date, Commencement Date, Invoice Date,
-                Issue Date, B/L Date, Shipment Date, Document Date, Contract Date, Date of Issue, Issued On.
-                ALSO look for dates embedded in reference lines such as:
-                  "Ref: Statement of Work dated March 27, 2017"
-                  "Statement of Work/Change Order dated July 25, 2017"
-                When multiple reference dates exist, use the LATEST one (most recent agreement/change order).
+                For License Invoice / purchase orders:
+                  - FIRST: only when the document clearly states a service/subscription/term PERIOD or RANGE in the body
+                    (e.g. "License period: MM/DD/YYYY – MM/DD/YYYY", "Term: … to …") — use the first date of that range.
+                    Do NOT use reference-only lines such as "Ref: … SOW dated March 20, 2017" or "Master Services
+                    Agreement dated …" as Start Date unless that same text is part of an explicit printed period/range.
+                  - OTHERWISE: prefer "PO Date" / "Order Date" over "Delivery Date" / shipment dates when both appear.
+                  - Also consider labeled Term Start, Period Start, License Start when clearly tied to a period (not a reference footnote).
+                Also look for: Invoice Date, Issue Date, B/L Date, Shipment Date, Document Date, Date of Issue, Issued On
+                when no PO and no explicit period exists.
                 How to set Start Date:
-                  1. Explicit start / effective / commencement date printed → use it directly.
-                  2. Reference lines with dated agreements/change orders → use the latest such date.
-                  3. PO/license forms: prefer PO Date or Order Date when shown and no better start date exists.
-                  4. Subscription/license: "Effective Date", "Term Start", "License Start" when labeled.
-                  5. A stated date range → first date is Start Date.
-                  6. Only month/year → first day of that month.
-                  7. Otherwise null.
+                  1. Stated date range in the body → first date is Start Date.
+                  2. PO/license forms: PO Date or Order Date when no explicit range exists.
+                  3. Delivery / expected delivery only when PO/order date is absent.
+                  4. Subscription/license: "Term Start", "License Start" when labeled as a period (not a reference line).
+                  5. Only month/year for an explicit start → first day of that month.
+                  6. Otherwise null.
                 Copy exactly as printed (original format). This is the default date for all line items.
   "End Date": use ONLY when the document explicitly states an end, expiration, delivery completion, or term
               end — or when a clear duration ties to a computable end (e.g. "24 months from effective date"
@@ -263,19 +262,19 @@ Field definitions for invoices — LINE ITEMS (per row in the pricing table):
       - If it cannot be determined: null.
   "Pricing Model": e.g. Fixed, Per Unit, Hybrid (Fixed + User), Paid Up
   "Start Date": start/issue date for this specific line item. Same priority as parent (must match downstream logic):
-                1. Service period / subscription or license term in the line or body (first date of a printed range).
-                2. Delivery / ship date when that is the operational start for this line.
-                3. PO Date / Order Date for license / PO rows (prefer when labeled on the line or parent header).
+                1. Explicit period or date range in the line or body (first date) — not reference-only SOW/MSA lines.
+                2. PO Date / Order Date (before delivery when both exist).
+                3. Delivery / ship / expected delivery when PO/order is absent.
                 4. Invoice Date / Invoice Dt only when none of the above exist.
                 Use null when not printed; do not copy invoice date into Start Date unless it is the only dated anchor.
-  "End Date": line-level end or delivery date ONLY when explicitly printed for that row (e.g. "Delivery date:
-              01/26/2023" under the line) or when parent End Date is explicitly set from the document (not from
-              payment-term math). Do NOT derive End Date from Net 30 / at sight / EOM. Otherwise copy parent
-              End Date if parent has an explicit end; use null if none.
+  "End Date": term/service/project end ONLY when explicitly printed (end date, expiration, completion of the obligation).
+              Do NOT put expected shipment/delivery dates here — those belong in Start Date (delivery tier) when they
+              anchor timing. Do NOT derive End Date from Net 30/60, at sight, or EOM. Use null when no explicit end exists.
 
 IMPORTANT for dates:
   - Include Start Date and End Date in "parent" only when supported by explicit text (or duration→end as above).
-  - License/PO: prefer PO Date / Order Date for parent Start Date when shown.
+  - License/PO: prefer PO Date / Order Date over Delivery Date when there is no explicit period range in the body.
+  - Do not populate Start Date from "SOW dated …" / "Ref: … Agreement dated …" unless the document also states a clear range or term.
   - Do NOT use payment terms (Net 30, etc.) to invent End Date.
   - Per-line delivery/shipment completion date under a row → that line's End Date only when it is clearly a term/service end,
     not payment due. Do not use "Due Date" for End Date when it is only payment timing.
@@ -499,7 +498,17 @@ _PO_DATE_KEYS_FOR_MATCH = [
     "p.o._date",
 ]
 
+_DELIVERY_ANCHOR_KEYS = [
+    "Delivery Date",
+    "delivery_date",
+    "Ship Date",
+    "ship_date",
+]
+
 # License invoice: do not map payment due / deadline labels to End Date (avoids payment timing as term end).
+# Do NOT include Delivery Date / delivery_date here: on POs that field is the expected ship/delivery anchor and is
+# handled as a Start Date fallback via _best_start_date_license_invoice. Mapping it to End Date caused Start=PO and
+# End=delivery → _fix_swapped_dates then swapped to wrong semantics (delivery as "start", PO as "end").
 _END_KEYS_LICENSE = [
     "End Date",
     "end_date",
@@ -511,8 +520,6 @@ _END_KEYS_LICENSE = [
     "termination_date",
     "Completion Date",
     "completion_date",
-    "Delivery Date",
-    "delivery_date",
 ]
 
 
@@ -544,15 +551,17 @@ def _apply_invoice_start_description(
         or _first_non_empty(parent, _INVOICE_DATE_KEYS_FOR_MATCH)
         or _first_non_empty(data, _INVOICE_DATE_KEYS_FOR_MATCH)
     )
+    if start_tier == "period":
+        return
     if start_tier == "delivery":
         _append_invoice_description(
             row,
-            "Start date from delivery/ship date (no explicit service period start in the document).",
+            "Start date from delivery/ship date (no explicit period range in the document body; PO/order date not used).",
         )
     elif start_tier == "po":
         _append_invoice_description(
             row,
-            "Start date from PO/order date (no earlier service period or delivery date in the document).",
+            "Start date from PO/order date (no explicit period range in the document body; reference-only lines such as SOW dates are not used).",
         )
     elif start_tier == "invoice":
         _append_invoice_description(
@@ -573,16 +582,17 @@ def _best_start_date_license_invoice(
 ) -> Tuple[str, str]:
     """
     Agreed priority for License / PO rows:
-      1) Service period / explicit contract start (not generic Start Date before PO/invoice)
-      2) Delivery / ship date
-      3) PO / order date (before invoice for license docs)
-      4) Labeled Start Date / start_date (after PO so PO wins)
+      1) Explicit period / term start in the body (labeled Service/Term/Period/License start — not SOW ref lines)
+      2) PO / order date (before delivery and invoice for typical POs)
+      3) Delivery / ship date
+      4) Labeled Start Date / start_date
       5) Invoice date (last resort)
-    Returns (value, tier_name) where tier_name is service|delivery|po|labeled_start|invoice|none.
+    Effective/Agreement/Commencement are omitted from tier 1 so reference-only SOW dates do not beat PO.
+    Returns (value, tier_name) where tier_name is period|po|delivery|labeled_start|invoice|none.
     """
     tiers: List[Tuple[str, List[str]]] = [
         (
-            "service",
+            "period",
             [
                 "Service Start",
                 "service_start",
@@ -593,25 +603,8 @@ def _best_start_date_license_invoice(
                 "Service Period Start",
                 "License Start",
                 "license_start",
-                "Effective Date",
-                "effective_date",
-                "Commencement Date",
-                "commencement_date",
-                "Agreement Date",
-                "agreement_date",
-                "Contract Start",
-                "contract_start",
-            ],
-        ),
-        (
-            "delivery",
-            [
-                "Delivery Date",
-                "delivery_date",
-                "Ship Date",
-                "ship_date",
-                "Expected Delivery",
-                "expected_delivery",
+                "Subscription Start",
+                "subscription_start",
             ],
         ),
         (
@@ -626,6 +619,17 @@ def _best_start_date_license_invoice(
                 "purchase_order_date",
                 "P.O. Date",
                 "p.o._date",
+            ],
+        ),
+        (
+            "delivery",
+            [
+                "Delivery Date",
+                "delivery_date",
+                "Ship Date",
+                "ship_date",
+                "Expected Delivery",
+                "expected_delivery",
             ],
         ),
         (
@@ -652,6 +656,54 @@ def _best_start_date_license_invoice(
         if v:
             return v, tier_name
     return "", "none"
+
+
+def _clear_end_when_end_is_non_term_anchor(
+    row: Dict[str, str],
+    start_tier: str,
+    start_val: str,
+    item: Dict[str, Any],
+    parent: Dict[str, Any],
+    data: Dict[str, Any],
+) -> None:
+    """
+    Clear End Date when it only duplicates shipment/delivery or PO anchors, not a stated term end.
+    Covers: Start=delivery with End=delivery or End=PO; Start=PO with End=delivery (model swap).
+    """
+    e_raw = (row.get("End Date") or "").strip()
+    if not e_raw:
+        return
+    delivery_val = (
+        _first_non_empty(item, _DELIVERY_ANCHOR_KEYS)
+        or _first_non_empty(parent, _DELIVERY_ANCHOR_KEYS)
+        or _first_non_empty(data, _DELIVERY_ANCHOR_KEYS)
+    )
+    po_val = (
+        _first_non_empty(item, _PO_DATE_KEYS_FOR_MATCH)
+        or _first_non_empty(parent, _PO_DATE_KEYS_FOR_MATCH)
+        or _first_non_empty(data, _PO_DATE_KEYS_FOR_MATCH)
+    )
+    if start_tier == "delivery" and start_val.strip():
+        if _dates_equal_for_note(e_raw, start_val):
+            row["End Date"] = ""
+            _append_invoice_description(
+                row,
+                "End date cleared: same calendar date as shipment/delivery anchor used for Start Date (not a stated term end).",
+            )
+            return
+        if po_val and _dates_equal_for_note(e_raw, po_val):
+            row["End Date"] = ""
+            _append_invoice_description(
+                row,
+                "End date cleared: value matched PO date only; delivery/shipment date was used for Start Date.",
+            )
+            return
+    if start_tier == "po" and delivery_val and _dates_equal_for_note(e_raw, delivery_val):
+        row["End Date"] = ""
+        _append_invoice_description(
+            row,
+            "End date cleared: value matched expected delivery/shipment date; not a stated term end.",
+        )
 
 
 def _clear_end_date_if_likely_net_payment_due(row: Dict[str, str], parent: Dict[str, Any]) -> None:
@@ -743,6 +795,7 @@ def _parse_extraction_response(
                 row[f] = v
 
             _apply_invoice_start_description(row, start_tier, start_val, item, parent, data)
+            _clear_end_when_end_is_non_term_anchor(row, start_tier, start_val, item, parent, data)
 
             if not row.get("Annual Value"):
                 row["Annual Value"] = _derive_annual_value(
