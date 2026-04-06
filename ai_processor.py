@@ -206,6 +206,8 @@ Field definitions for invoices — PARENT (document-level):
   "Contract Type": e.g. Addendum / Subscription, Perpetual, Service / PO
   "Billing Frequency": e.g. Annual, One-time, Project-based
   "Currency": 3-letter code (USD, EUR, RUB) or symbol ($, €)
+  "Description": ALWAYS set to null — this field is populated by downstream post-processing to describe
+                 date derivation logic. Do NOT put product descriptions, summaries, or any other text here.
   For purchase orders and license invoices: always include a "PO Date" field in the parent object when the
   document shows a PO date / order date (e.g. header "PO Date: MM/DD/YYYY"), even if Start Date and End Date
   are empty — downstream logic may use PO Date as Start Date when no other dates were extracted.
@@ -759,6 +761,10 @@ def _parse_extraction_response(
         parent = data.get("parent") or {}
         for f in INVOICE_PARENT_FIELDS:
             base[f] = _safe_str(parent.get(f))
+
+        # Description is reserved for date-derivation notes added by post-processing helpers.
+        # Discard whatever the model returned (often a product summary, not validation context).
+        base["Description"] = ""
 
         parent_end = _first_non_empty(parent, _END_KEYS_LICENSE)
 
