@@ -540,8 +540,9 @@ def _apply_invoice_start_description(
     parent: Dict[str, Any],
     data: Dict[str, Any],
 ) -> None:
-    """Append Description notes when Start Date is derived from fallback tiers (not explicit service period)."""
+    """Append Description notes explaining how Start Date was determined (for validation support)."""
     if not start_val.strip():
+        _append_invoice_description(row, "No start date found in the document.")
         return
     po_val = (
         _first_non_empty(item, _PO_DATE_KEYS_FOR_MATCH)
@@ -553,28 +554,53 @@ def _apply_invoice_start_description(
         or _first_non_empty(parent, _INVOICE_DATE_KEYS_FOR_MATCH)
         or _first_non_empty(data, _INVOICE_DATE_KEYS_FOR_MATCH)
     )
+    delivery_val = (
+        _first_non_empty(item, _DELIVERY_ANCHOR_KEYS)
+        or _first_non_empty(parent, _DELIVERY_ANCHOR_KEYS)
+        or _first_non_empty(data, _DELIVERY_ANCHOR_KEYS)
+    )
+
     if start_tier == "period":
-        return
-    if start_tier == "delivery":
         _append_invoice_description(
             row,
-            "Start date from delivery/ship date (no explicit period range in the document body; PO/order date not used).",
+            "Start date from explicit service/subscription period stated in the document.",
         )
     elif start_tier == "po":
         _append_invoice_description(
             row,
-            "Start date from PO/order date (no explicit period range in the document body; reference-only lines such as SOW dates are not used).",
+            "Start date from PO/order date (no explicit period range found in the document).",
+        )
+    elif start_tier == "delivery":
+        _append_invoice_description(
+            row,
+            "Start date from delivery/ship date (no explicit period range or PO/order date in the document).",
         )
     elif start_tier == "invoice":
         _append_invoice_description(
             row,
-            "Start date from invoice date (no service period, delivery, or PO date found in the document).",
+            "Start date from invoice date (no service period, PO/order, or delivery date found in the document).",
         )
-    elif start_tier == "labeled_start" and inv_val and not po_val and _dates_equal_for_note(start_val, inv_val):
-        _append_invoice_description(
-            row,
-            "Start date from invoice date (no service period or PO date; the Start Date field matched the invoice date).",
-        )
+    elif start_tier == "labeled_start":
+        if po_val and _dates_equal_for_note(start_val, po_val):
+            _append_invoice_description(
+                row,
+                "Start date matches PO/order date (used as Start Date; no explicit period range in the document).",
+            )
+        elif delivery_val and _dates_equal_for_note(start_val, delivery_val):
+            _append_invoice_description(
+                row,
+                "Start date matches delivery/ship date (used as Start Date; no explicit period range in the document).",
+            )
+        elif inv_val and _dates_equal_for_note(start_val, inv_val):
+            _append_invoice_description(
+                row,
+                "Start date matches invoice date (no service period or PO date found; invoice date used as Start Date).",
+            )
+        else:
+            _append_invoice_description(
+                row,
+                "Start date taken from document's labeled Start Date field.",
+            )
 
 
 def _best_start_date_license_invoice(
@@ -812,6 +838,15 @@ def _parse_extraction_response(
                 )
             _clear_end_date_if_likely_net_payment_due(row, parent)
             _fix_swapped_dates(row)
+
+            if not (row.get("End Date") or "").strip():
+                existing_desc = (row.get("Description") or "").lower()
+                if "end date" not in existing_desc:
+                    _append_invoice_description(
+                        row,
+                        "No explicit end date or contract duration found in the document.",
+                    )
+
             rows.append(row)
 
         logger.info(
