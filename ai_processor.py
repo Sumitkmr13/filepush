@@ -603,6 +603,59 @@ def _apply_invoice_start_description(
             )
 
 
+# Map _END_KEYS_LICENSE entries to human-readable labels for description notes.
+_END_KEY_LABELS: Dict[str, str] = {
+    "End Date": "End Date", "end_date": "End Date",
+    "Expiration Date": "Expiration Date", "expiration_date": "Expiration Date",
+    "Maturity Date": "Maturity Date", "maturity_date": "Maturity Date",
+    "Termination Date": "Termination Date", "termination_date": "Termination Date",
+    "Completion Date": "Completion Date", "completion_date": "Completion Date",
+}
+
+
+def _apply_invoice_end_description(
+    row: Dict[str, str],
+    item: Dict[str, Any],
+    parent: Dict[str, Any],
+    data: Dict[str, Any],
+) -> None:
+    """Append Description notes explaining how End Date was determined (or why it is empty)."""
+    existing_desc = (row.get("Description") or "").lower()
+    if "end date" in existing_desc or "end date" in existing_desc:
+        return
+
+    end_val = (row.get("End Date") or "").strip()
+    if not end_val:
+        _append_invoice_description(
+            row,
+            "No explicit end date or contract duration found in the document.",
+        )
+        return
+
+    for key in _END_KEYS_LICENSE:
+        v = _safe_str(item.get(key))
+        if v and _dates_equal_for_note(v, end_val):
+            label = _END_KEY_LABELS.get(key, key)
+            _append_invoice_description(
+                row,
+                f"End date from line-item's {label} field as stated in the document.",
+            )
+            return
+    for key in _END_KEYS_LICENSE:
+        v = _safe_str(parent.get(key))
+        if v and _dates_equal_for_note(v, end_val):
+            label = _END_KEY_LABELS.get(key, key)
+            _append_invoice_description(
+                row,
+                f"End date from document-level {label} field as stated in the document.",
+            )
+            return
+    _append_invoice_description(
+        row,
+        "End date as stated in the document.",
+    )
+
+
 def _best_start_date_license_invoice(
     item: Dict[str, Any],
     parent: Dict[str, Any],
@@ -838,14 +891,7 @@ def _parse_extraction_response(
                 )
             _clear_end_date_if_likely_net_payment_due(row, parent)
             _fix_swapped_dates(row)
-
-            if not (row.get("End Date") or "").strip():
-                existing_desc = (row.get("Description") or "").lower()
-                if "end date" not in existing_desc:
-                    _append_invoice_description(
-                        row,
-                        "No explicit end date or contract duration found in the document.",
-                    )
+            _apply_invoice_end_description(row, item, parent, data)
 
             rows.append(row)
 
