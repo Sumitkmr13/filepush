@@ -49,6 +49,7 @@ from state_manager import (
     get_processed_ids,
     get_processed_meta,
     mark_processed,
+    record_dedup_decisions,
     should_process_item,
 )
 from sharepoint_utils import (
@@ -249,9 +250,13 @@ def _write_excel(
             df[date_col] = df[date_col].apply(lambda v: clean_date(v, month_year_position=position))
 
     # Same filename base with revision markers → keep only the latest revision
-    df = dedupe_keep_latest_revision(df, output_fields)
+    df, rev_dedup_log = dedupe_keep_latest_revision(df, output_fields)
     # Same base Contract ID (e.g. 4533232908 vs 4533232908-1) → keep latest version by Start Date
-    df = dedupe_by_contract_id(df)
+    df, cid_dedup_log = dedupe_by_contract_id(df)
+    # Persist dedup decisions to extraction_state.json
+    all_dedup_log = rev_dedup_log + cid_dedup_log
+    if all_dedup_log:
+        record_dedup_decisions(all_dedup_log)
     # Exact duplicate rows (e.g. same file processed twice); include Filename so rev variants are not collapsed here
     df = remove_duplicate_entries(df, fields=output_fields + ["Filename"])
     df.to_excel(str(excel_path), index=False)

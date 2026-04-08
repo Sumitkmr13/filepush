@@ -6,7 +6,7 @@ import re
 import logging
 import calendar
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -248,7 +248,7 @@ def _build_contract_id_groups(raw_ids: List[str]) -> Dict[str, str]:
 
 def dedupe_by_contract_id(
     df: pd.DataFrame,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
     """
     When multiple files produce rows with the same (or suffix-related) Contract ID,
     keep only the rows from the **latest version** of that contract.
@@ -280,6 +280,7 @@ def dedupe_by_contract_id(
         buckets.setdefault(group, {}).setdefault(fname, []).append(idx)
 
     drop_indices: set = set()
+    dedup_log: List[Dict[str, Any]] = []
     for group_base, file_versions in buckets.items():
         if len(file_versions) <= 1:
             continue
@@ -306,9 +307,33 @@ def dedupe_by_contract_id(
         winner = sorted_files[0]
         losers = sorted_files[1:]
 
+        winner_key = _version_sort_key(winner)
+        winner_start = winner_key[0].isoformat() if winner_key[0] != pd.Timestamp.min else ""
+
         loser_indices = []
         for fn in losers:
             loser_indices.extend(file_versions[fn])
+            loser_key = _version_sort_key(fn)
+            loser_start = loser_key[0].isoformat() if loser_key[0] != pd.Timestamp.min else ""
+            loser_cids = sorted(set(str(df.loc[i, "Contract ID"]) for i in file_versions[fn]))
+            reason_parts = []
+            if winner_start and loser_start and winner_key[0] > loser_key[0]:
+                reason_parts.append(f"kept file has later Start Date ({winner_start} vs {loser_start})")
+            elif winner_key[1] > loser_key[1]:
+                reason_parts.append("kept file has later End Date")
+            elif winner_key[2] > loser_key[2]:
+                reason_parts.append(f"kept file has higher Contract ID suffix ({winner_key[2]} vs {loser_key[2]})")
+            else:
+                reason_parts.append("kept file appeared first with same dates")
+            dedup_log.append({
+                "dropped_file": fn,
+                "dropped_contract_ids": loser_cids,
+                "kept_file": winner,
+                "kept_contract_id": sorted(set(str(df.loc[i, "Contract ID"]) for i in file_versions[winner])),
+                "group_base": group_base,
+                "reason": "Contract ID duplicate: " + "; ".join(reason_parts),
+                "dedup_type": "contract_id",
+            })
         drop_indices.update(loser_indices)
 
         if loser_indices:
@@ -323,14 +348,14 @@ def dedupe_by_contract_id(
             "Contract ID dedup total: dropped %s row(s) from older contract versions.",
             len(drop_indices),
         )
-        return df.drop(index=list(drop_indices)).reset_index(drop=True)
-    return df
+        return df.drop(index=list(drop_indices)).reset_index(drop=True), dedup_log
+    return df, dedup_log
 
 
 def dedupe_keep_latest_revision(
     df: pd.DataFrame,
     output_fields: List[str],
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
     """
     When multiple rows share the same logical document name (differing only by revision
     markers like 'Revision 0', 'Revision 1', 'v2', etc.), keep ONLY the rows from the
@@ -343,7 +368,7 @@ def dedupe_keep_latest_revision(
     revision number wins; ties broken by latest End Date.
     """
     if df.empty or len(df) < 2:
-        return df
+        return df, []
 
     # Build buckets keyed by filename base (revision markers stripped).
     # Each bucket entry: (revision_num, row_index, row).
@@ -354,16 +379,13 @@ def dedupe_keep_latest_revision(
 
     kept_indices: list = []
     removed = 0
+    dedup_log: List[Dict[str, Any]] = []
     for base, items in buckets.items():
         if len(items) == 1:
             kept_indices.append(items[0][1])
             continue
 
-        # Find the maximum revision number in the group.
         max_rev = max(r for r, _, _ in items)
-
-        # Keep all rows from the highest revision (a multi-line-item invoice
-        # produces multiple rows with the same filename — keep them all).
         best_items = [(r, i, row) for r, i, row in items if r == max_rev]
         dropped_items = [(r, i, row) for r, i, row in items if r != max_rev]
 
@@ -378,13 +400,24 @@ def dedupe_keep_latest_revision(
                 "Revision dedup [%s]: keeping %s (rev %s), dropping %s older revision(s): %s",
                 base, kept_names, max_rev, len(dropped_items), dropped_names,
             )
+            for dname in dropped_names:
+                d_rev = max(r for r, _, row in dropped_items if str(row.get("Filename", "")) == dname)
+                dedup_log.append({
+                    "dropped_file": dname,
+                    "dropped_contract_ids": [],
+                    "kept_file": kept_names[0] if len(kept_names) == 1 else kept_names,
+                    "kept_contract_id": [],
+                    "group_base": base,
+                    "reason": f"Filename revision duplicate: kept rev {max_rev}, dropped rev {d_rev}",
+                    "dedup_type": "filename_revision",
+                })
 
     if removed:
         logger.info(
             "Revision dedup total: dropped %s row(s) from older revisions across all filename groups.",
             removed,
         )
-    return df.loc[kept_indices].reset_index(drop=True)
+    return df.loc[kept_indices].reset_index(drop=True), dedup_log
 
 
 # Run unit tests: python data_utils.py
