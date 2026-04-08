@@ -250,17 +250,18 @@ def dedupe_by_contract_id(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    When multiple rows share the same base Contract ID (e.g. '4533232908' and '4533232908-1'),
+    When multiple files produce rows with the same (or suffix-related) Contract ID,
     keep only the rows from the **latest version** of that contract.
 
-    Latest version is determined by:
-      1. The most recent Start Date across all rows of that version (later = newer revision).
-      2. If Start Dates tie, prefer the version with the most recent End Date.
-      3. If still tied, prefer the version whose Contract ID has the highest suffix number
-         (e.g. -2 > -1 > no suffix).
+    Versions are identified by **Filename** — each distinct PDF is one version.
+    This handles:
+      a) Different filenames, same Contract ID (e.g. two PDFs both say '11 005')
+      b) Suffix variants (e.g. '4533232908' vs '4533232908-1' from different PDFs)
 
-    A "version" is all rows sharing the same original (un-normalized) Contract ID — this
-    preserves multi-line-item invoices where the same Contract ID appears on several rows.
+    Latest version is determined by:
+      1. Most recent Start Date across all rows of that file (later = newer version).
+      2. Most recent End Date as tiebreaker.
+      3. Highest Contract ID suffix number (-2 > -1 > none) as final tiebreaker.
     """
     if df.empty or len(df) < 2 or "Contract ID" not in df.columns:
         return df
@@ -268,21 +269,23 @@ def dedupe_by_contract_id(
     raw_ids = [str(row.get("Contract ID", "") or "").strip() for _, row in df.iterrows()]
     id_to_group = _build_contract_id_groups(raw_ids)
 
+    # buckets[group_base][filename] = list of row indices
     buckets: Dict[str, Dict[str, list]] = {}
     for idx, row in df.iterrows():
         raw_cid = str(row.get("Contract ID", "") or "").strip()
         group = id_to_group.get(raw_cid, normalize_contract_id(raw_cid))
         if not group:
             continue
-        buckets.setdefault(group, {}).setdefault(raw_cid, []).append(idx)
+        fname = str(row.get("Filename", "") or "").strip()
+        buckets.setdefault(group, {}).setdefault(fname, []).append(idx)
 
     drop_indices: set = set()
-    for group_base, versions in buckets.items():
-        if len(versions) <= 1:
+    for group_base, file_versions in buckets.items():
+        if len(file_versions) <= 1:
             continue
 
-        def _version_sort_key(raw_cid: str) -> Tuple:
-            indices = versions[raw_cid]
+        def _version_sort_key(fname: str) -> Tuple:
+            indices = file_versions[fname]
             rows_sub = df.loc[indices]
             best_start = max(
                 (_date_for_sort(r, "Start Date") for _, r in rows_sub.iterrows()),
@@ -292,25 +295,27 @@ def dedupe_by_contract_id(
                 (_date_for_sort(r, "End Date") for _, r in rows_sub.iterrows()),
                 default=pd.Timestamp.min,
             )
-            _, suffix_num = _strip_version_suffix(normalize_contract_id(raw_cid))
+            raw_cids = rows_sub["Contract ID"].astype(str).unique()
+            suffix_num = max(
+                (_strip_version_suffix(normalize_contract_id(c))[1] for c in raw_cids),
+                default=0,
+            )
             return (best_start, best_end, suffix_num)
 
-        sorted_versions = sorted(versions.keys(), key=_version_sort_key, reverse=True)
-        winner = sorted_versions[0]
-        losers = sorted_versions[1:]
+        sorted_files = sorted(file_versions.keys(), key=_version_sort_key, reverse=True)
+        winner = sorted_files[0]
+        losers = sorted_files[1:]
 
         loser_indices = []
-        for cid in losers:
-            loser_indices.extend(versions[cid])
+        for fn in losers:
+            loser_indices.extend(file_versions[fn])
         drop_indices.update(loser_indices)
 
         if loser_indices:
-            kept_filenames = sorted(set(str(df.loc[i, "Filename"]) for i in versions[winner]))
-            dropped_filenames = sorted(set(str(df.loc[i, "Filename"]) for i in loser_indices))
             logger.info(
-                "Contract ID dedup [%s]: keeping %s (%s), dropping older version(s) %s: %s",
-                group_base, winner, kept_filenames,
-                [c for c in losers], dropped_filenames,
+                "Contract ID dedup [%s]: keeping '%s' (%s rows), dropping older version(s): %s",
+                group_base, winner, len(file_versions[winner]),
+                {fn: len(file_versions[fn]) for fn in losers},
             )
 
     if drop_indices:
