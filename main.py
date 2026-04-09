@@ -32,6 +32,7 @@ from config import (
     EXCEL_SOW_PATH,
     EXCEL_INVOICE_PATH,
     EXTRACTION_MONITOR_INTERVAL_MINUTES,
+    EXTRACTION_STATE_PATH,
     FIELDS,
     INVOICE_FIELDS,
     SOW_FIELDS,
@@ -275,6 +276,36 @@ def _write_excel(
     return len(df)
 
 
+_STATE_BLOB_NAME = "extraction_state.json"
+
+
+def _sync_state_from_gcs() -> None:
+    """Download extraction_state.json from GCS if available; fall back to local file."""
+    if not GCS_OUTPUT_BUCKET:
+        return
+    try:
+        from gcs_utils import download_file_from_bucket
+        ok = download_file_from_bucket(GCS_OUTPUT_BUCKET, _STATE_BLOB_NAME, EXTRACTION_STATE_PATH)
+        if ok:
+            logger.info("Extraction state synced from GCS (gs://%s/%s).", GCS_OUTPUT_BUCKET, _STATE_BLOB_NAME)
+        else:
+            logger.info("No extraction state in GCS; using local file if present.")
+    except Exception as e:
+        logger.warning("Could not download extraction state from GCS: %s. Using local file.", e)
+
+
+def _upload_state_to_gcs() -> None:
+    """Upload extraction_state.json to GCS alongside the Excel files."""
+    if not GCS_OUTPUT_BUCKET or not EXTRACTION_STATE_PATH.exists():
+        return
+    try:
+        from gcs_utils import upload_file_to_bucket
+        gs_url = upload_file_to_bucket(EXTRACTION_STATE_PATH, GCS_OUTPUT_BUCKET, blob_name=_STATE_BLOB_NAME)
+        logger.info("Extraction state uploaded to GCS: %s", gs_url)
+    except Exception as e:
+        logger.warning("Failed to upload extraction state to GCS: %s", e)
+
+
 def _route_doc_type(doc_type_raw: str) -> str:
     """Return 'invoice' or 'sow' from a raw Document Type string extracted by the LLM."""
     v = doc_type_raw.strip().lower()
@@ -298,6 +329,8 @@ def _run_extraction(stop_check: Optional[Callable[[], bool]] = None, force_repro
     with _extraction_lock:
         _extraction_state["current_file"] = "Listing + processing (starting as PDFs are found)..."
         _extraction_state["total_to_process"] = -1
+
+    _sync_state_from_gcs()
 
     logger.info(
         "Extraction started: listing and processing in parallel (%s). "
@@ -406,6 +439,8 @@ def _run_extraction(stop_check: Optional[Callable[[], bool]] = None, force_repro
             EXCEL_INVOICE_PATH, existing_inv_df, invoice_results, INVOICE_FIELDS,
             gcs_blob_name=EXCEL_INVOICE_PATH.name, upload_to_gcs=upload,
         )
+        if upload:
+            _upload_state_to_gcs()
         return sow_total + inv_total
 
     idx = 0
