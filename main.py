@@ -1066,6 +1066,11 @@ async def read_index():
   </div>
 
   <script>
+    const uiState = {
+      pollTimer: null,
+      wasActive: false,
+    };
+
     function buildUrl(path) {
       const base = (document.getElementById("apiBase").value || "").trim();
       if (!base) return path;
@@ -1126,6 +1131,17 @@ async def read_index():
       }
     }
 
+    function startAutoPolling() {
+      if (uiState.pollTimer) return;
+      uiState.pollTimer = setInterval(refreshStatus, 3000);
+    }
+
+    function stopAutoPolling() {
+      if (!uiState.pollTimer) return;
+      clearInterval(uiState.pollTimer);
+      uiState.pollTimer = null;
+    }
+
     async function refreshStatus() {
       try {
         const data = await apiCall("/extract-sow/status");
@@ -1146,10 +1162,22 @@ async def read_index():
         document.getElementById("overviewStopRequested").textContent = stop;
         document.getElementById("overviewLastError").textContent = err;
         document.getElementById("statusHint").textContent = `Last updated: ${new Date().toLocaleTimeString()}`;
+
+        const isActive = !!data.running || !!data.stop_requested;
+        if (isActive) {
+          startAutoPolling();
+        } else {
+          if (uiState.wasActive) {
+            await Promise.all([refreshStateCards(), refreshDownloads()]);
+          }
+          stopAutoPolling();
+        }
+        uiState.wasActive = isActive;
       } catch (err) {
         document.getElementById("statusHint").textContent = "Status error: " + err.message;
         setSystemBadge(false);
         setToggleButton(false);
+        stopAutoPolling();
       }
     }
 
@@ -1189,16 +1217,19 @@ async def read_index():
 
     async function startJob() {
       try {
+        startAutoPolling();
         const data = await apiCall("/extract-sow/start", "POST");
         showToast(data.message || "Started extraction", "ok");
         await refreshStatus();
       } catch (err) {
+        stopAutoPolling();
         showToast("Start failed: " + err.message, "error");
       }
     }
 
     async function stopJob() {
       try {
+        startAutoPolling();
         const data = await apiCall("/extract-sow/stop", "POST");
         showToast(data.message || "Stop requested", "ok");
         await refreshStatus();
@@ -1251,7 +1282,6 @@ async def read_index():
     }
 
     refreshAll();
-    setInterval(refreshAll, 3000);
   </script>
 </body>
 </html>
