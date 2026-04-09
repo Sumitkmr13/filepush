@@ -1,0 +1,36 @@
+# Git / IDE
+.git
+.gitignore
+.cursor
+.vscode
+mcps
+
+# Tests and caches
+tests
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+htmlcov
+.coverage
+
+# Docs (not needed in image)
+*.md
+LICENSE
+
+# Local secrets and env (mount at runtime, do not bake into image)
+.env
+.env.*
+!.env.example
+secrets
+
+# Docker / compose (optional; avoids recursive context noise)
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Misc
+*.log
+.DS_Store
+Thumbs.db
