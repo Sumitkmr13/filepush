@@ -932,8 +932,6 @@ async def read_index():
     html, body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: #f8fafc; color: #0f172a; }
     a { color: #1e40af; }
     .fallback-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 0.75rem; padding: 1rem; box-shadow: 0 1px 2px rgba(0,0,0,.05); }
-    #activityLog { background: #0f172a !important; color: #e2e8f0 !important; }
-    #statusBox { background: #f1f5f9 !important; color: #0f172a !important; border: 1px solid #e2e8f0; }
   </style>
 </head>
 <body class="bg-slate-50 text-slate-900" style="background:#f8fafc;color:#0f172a;">
@@ -942,7 +940,7 @@ async def read_index():
       <div>
         <h1 class="text-2xl md:text-3xl font-bold">SOW &amp; Invoice Extraction Intelligence</h1>
         <p class="text-sm text-slate-600 mt-1">Production dashboard for SharePoint document processing.</p>
-        <p class="text-xs text-indigo-700 font-semibold mt-1" id="uiBuildMarker">UI v2 · single-shot extraction · manual refresh only</p>
+        <p class="text-xs text-indigo-700 font-semibold mt-1" id="uiBuildMarker">UI v2 · single-shot extraction · auto-refresh enabled</p>
       </div>
       <div id="systemBadge" class="inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm font-medium bg-emerald-100 text-emerald-700">
         <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
@@ -1024,17 +1022,38 @@ async def read_index():
       </div>
     </section>
 
-    <section class="mt-4 grid grid-cols-1 xl:grid-cols-2 gap-4">
-      <div class="rounded-xl bg-white border border-slate-200 p-4 shadow-sm">
-        <h2 class="text-lg font-semibold mb-2">Activity Log</h2>
-        <div id="activityLog" class="h-72 overflow-auto rounded-md bg-slate-950 text-slate-100 text-xs p-3 font-mono">
-          <div class="text-slate-400">Waiting for activity...</div>
+    <section class="mt-4 rounded-xl bg-white border border-slate-200 p-4 shadow-sm">
+      <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-2">
+        <h2 class="text-lg font-semibold">Processing Overview</h2>
+        <div id="statusHint" class="text-xs text-slate-500">Waiting for status...</div>
+      </div>
+      <div class="mt-3 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <div class="text-xs text-slate-500">Current Phase</div>
+          <div id="overviewPhase" class="text-sm font-semibold text-slate-900 mt-1">-</div>
+        </div>
+        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <div class="text-xs text-slate-500">Current File</div>
+          <div id="overviewFile" class="text-sm font-semibold text-slate-900 mt-1 break-all">-</div>
+        </div>
+        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <div class="text-xs text-slate-500">Processed This Run</div>
+          <div id="overviewProcessed" class="text-sm font-semibold text-slate-900 mt-1">0</div>
+        </div>
+        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <div class="text-xs text-slate-500">Total To Process</div>
+          <div id="overviewTotalToProcess" class="text-sm font-semibold text-slate-900 mt-1">discovering...</div>
         </div>
       </div>
-
-      <div class="rounded-xl bg-white border border-slate-200 p-4 shadow-sm">
-        <h2 class="text-lg font-semibold mb-2">Live Processing Status</h2>
-        <pre id="statusBox" class="h-72 overflow-auto rounded-md bg-slate-100 p-3 text-xs text-slate-800">Loading...</pre>
+      <div class="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <div class="text-xs text-slate-500">Stop Requested</div>
+          <div id="overviewStopRequested" class="text-sm font-semibold text-slate-900 mt-1">No</div>
+        </div>
+        <div class="rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <div class="text-xs text-slate-500">Last Error</div>
+          <div id="overviewLastError" class="text-sm font-semibold text-slate-900 mt-1 break-all">None</div>
+        </div>
       </div>
     </section>
 
@@ -1047,11 +1066,6 @@ async def read_index():
   </div>
 
   <script>
-    const uiState = {
-      lastActivityKey: "",
-      logLines: [],
-    };
-
     function buildUrl(path) {
       const base = (document.getElementById("apiBase").value || "").trim();
       if (!base) return path;
@@ -1112,52 +1126,30 @@ async def read_index():
       }
     }
 
-    function appendActivity(line) {
-      uiState.logLines.push(line);
-      if (uiState.logLines.length > 120) uiState.logLines = uiState.logLines.slice(-120);
-      const box = document.getElementById("activityLog");
-      box.innerHTML = uiState.logLines.map(x => `<div>${x}</div>`).join("");
-      box.scrollTop = box.scrollHeight;
-    }
-
-    function renderReadableStatus(data) {
-      const phase = data.phase || "idle";
-      const total = (data.total_to_process && data.total_to_process > 0) ? data.total_to_process : "discovering...";
-      const current = data.current_file || "-";
-      const err = data.last_error || "None";
-      const stop = data.stop_requested ? "Yes" : "No";
-      const running = data.running ? "Yes" : "No";
-      return [
-        `Running: ${running}`,
-        `Phase: ${phase}`,
-        `Processed this run: ${data.processed_this_run || 0}`,
-        `Total to process: ${total}`,
-        `Current file: ${current}`,
-        `Stop requested: ${stop}`,
-        `Total rows in output excel(s): ${data.total_in_excel || 0}`,
-        `Last error: ${err}`,
-      ].join(String.fromCharCode(10));
-    }
-
     async function refreshStatus() {
       try {
         const data = await apiCall("/extract-sow/status");
-        document.getElementById("statusBox").textContent = renderReadableStatus(data);
         setSystemBadge(!!data.running);
         setToggleButton(!!data.running);
         document.getElementById("statErr").textContent = data.last_error ? 1 : 0;
-        const key = [data.current_file || "", data.processed_this_run || 0, data.running ? "run" : "idle"].join("|");
-        if (key !== uiState.lastActivityKey && data.current_file) {
-          uiState.lastActivityKey = key;
-          const ts = new Date().toLocaleTimeString();
-          appendActivity(`[${ts}] ${data.running ? "Processing" : "Last file"}: ${data.current_file}`);
-        }
-        if (data.last_error) {
-          appendActivity(`[${new Date().toLocaleTimeString()}] ERROR: ${data.last_error}`);
-        }
+
+        const total = (data.total_to_process && data.total_to_process > 0) ? data.total_to_process : "discovering...";
+        const phase = data.phase || "idle";
+        const current = data.current_file || "-";
+        const err = data.last_error || "None";
+        const stop = data.stop_requested ? "Yes" : "No";
+
+        document.getElementById("overviewPhase").textContent = phase;
+        document.getElementById("overviewFile").textContent = current;
+        document.getElementById("overviewProcessed").textContent = data.processed_this_run || 0;
+        document.getElementById("overviewTotalToProcess").textContent = total;
+        document.getElementById("overviewStopRequested").textContent = stop;
+        document.getElementById("overviewLastError").textContent = err;
+        document.getElementById("statusHint").textContent = `Last updated: ${new Date().toLocaleTimeString()}`;
       } catch (err) {
-        document.getElementById("statusBox").textContent = "Status error: " + err.message;
-        showToast("Failed to fetch /extract-sow/status", "error");
+        document.getElementById("statusHint").textContent = "Status error: " + err.message;
+        setSystemBadge(false);
+        setToggleButton(false);
       }
     }
 
@@ -1259,6 +1251,7 @@ async def read_index():
     }
 
     refreshAll();
+    setInterval(refreshAll, 3000);
   </script>
 </body>
 </html>
