@@ -6,6 +6,7 @@ Entry point: run with uvicorn or via Docker.
 import asyncio
 import logging
 import threading
+from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
 from queue import Empty, Queue
@@ -69,7 +70,18 @@ _URL_KEY = "SharePoint URL"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="SOW RAG Extractor (Vertex AI + SharePoint)")
+
+@asynccontextmanager
+async def _app_lifespan(app: FastAPI):
+    """Restore state + Excel from GCS on startup (Cloud Run cold start)."""
+    await asyncio.to_thread(_sync_persistent_data_from_gcs)
+    yield
+
+
+app = FastAPI(
+    title="SOW RAG Extractor (Vertex AI + SharePoint)",
+    lifespan=_app_lifespan,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -315,12 +327,6 @@ def _upload_state_to_gcs() -> None:
         logger.info("Extraction state uploaded to GCS: %s", gs_url)
     except Exception as e:
         logger.warning("Failed to upload extraction state to GCS: %s", e)
-
-
-@app.on_event("startup")
-def _startup_sync_persistent_data_from_gcs() -> None:
-    """Restore state + Excel from GCS on process start (Cloud Run cold start, new container)."""
-    _sync_persistent_data_from_gcs()
 
 
 def _route_doc_type(doc_type_raw: str) -> str:
