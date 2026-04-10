@@ -279,8 +279,13 @@ def _write_excel(
 _STATE_BLOB_NAME = "extraction_state.json"
 
 
-def _sync_state_from_gcs() -> None:
-    """Download extraction_state.json from GCS if available; fall back to local file."""
+def _sync_persistent_data_from_gcs() -> None:
+    """
+    Download extraction_state.json and cumulative Excel files from GCS when configured.
+
+    Needed for Cloud Run (ephemeral disk): a new instance must restore state and Excels
+    before Smart Resume and /download work. Safe no-op when GCS_OUTPUT_BUCKET is unset.
+    """
     if not GCS_OUTPUT_BUCKET:
         return
     try:
@@ -290,8 +295,14 @@ def _sync_state_from_gcs() -> None:
             logger.info("Extraction state synced from GCS (gs://%s/%s).", GCS_OUTPUT_BUCKET, _STATE_BLOB_NAME)
         else:
             logger.info("No extraction state in GCS; using local file if present.")
+        for excel_path in (EXCEL_SOW_PATH, EXCEL_INVOICE_PATH):
+            blob_name = excel_path.name
+            if download_file_from_bucket(GCS_OUTPUT_BUCKET, blob_name, excel_path):
+                logger.info("Excel synced from GCS: gs://%s/%s", GCS_OUTPUT_BUCKET, blob_name)
+            else:
+                logger.info("No %s in GCS yet; will create on first successful save.", blob_name)
     except Exception as e:
-        logger.warning("Could not download extraction state from GCS: %s. Using local file.", e)
+        logger.warning("Could not sync persistent data from GCS: %s. Using local files if present.", e)
 
 
 def _upload_state_to_gcs() -> None:
@@ -304,6 +315,12 @@ def _upload_state_to_gcs() -> None:
         logger.info("Extraction state uploaded to GCS: %s", gs_url)
     except Exception as e:
         logger.warning("Failed to upload extraction state to GCS: %s", e)
+
+
+@app.on_event("startup")
+def _startup_sync_persistent_data_from_gcs() -> None:
+    """Restore state + Excel from GCS on process start (Cloud Run cold start, new container)."""
+    _sync_persistent_data_from_gcs()
 
 
 def _route_doc_type(doc_type_raw: str) -> str:
@@ -330,7 +347,7 @@ def _run_extraction(stop_check: Optional[Callable[[], bool]] = None, force_repro
         _extraction_state["current_file"] = "Listing + processing (starting as PDFs are found)..."
         _extraction_state["total_to_process"] = -1
 
-    _sync_state_from_gcs()
+    _sync_persistent_data_from_gcs()
 
     logger.info(
         "Extraction started: listing and processing in parallel (%s). "
@@ -1296,5 +1313,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "test":
         import pytest
         sys.exit(pytest.main(["-v", "tests/test_main.py"]))
+    import os
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
