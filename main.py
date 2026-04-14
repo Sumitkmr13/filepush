@@ -14,7 +14,8 @@ from typing import Callable, Optional
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load baked-in or local .env next to this package (e.g. /app/.env in Docker).
+load_dotenv(Path(__file__).resolve().parent / ".env")
 # Optional: load SharePoint secrets from GCP Secret Manager into os.environ (before config is read)
 try:
     from secret_loader import load_secrets_from_gcp
