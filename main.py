@@ -66,6 +66,7 @@ from sharepoint_utils import (
     list_pdf_items_streaming,
     download_file_bytes,
     verify_sharepoint_path_reachable,
+    get_access_token,
 )
 # Single-shot extraction: root ai_processor.py only (Gemini OCR + JSON extraction).
 from ai_processor import _normalize_field_value, debug_pdf_bytes, process_pdf_bytes
@@ -195,21 +196,24 @@ def _auto_resolve_sharepoint_context_from_url(
     if len(segments) <= 2:
         return raw.rstrip("/"), drive_path
 
-    # Try longest->shortest candidate site paths and stop at first reachable site.
-    # Remaining tail becomes inferred drive_path when user didn't provide one.
+    # Try candidate splits and validate site+folder together.
+    # This is more robust than checking site root only, because user permissions
+    # may be scoped and many pasted URLs point to deep folders/libraries.
     min_site_segments = 2
     max_checks = min(len(segments), 10)
+    preferred_drive_path = (drive_path or "").strip().strip("/")
     for i in range(max_checks, min_site_segments - 1, -1):
         candidate_site = f"{parsed.scheme}://{parsed.netloc}/{'/'.join(segments[:i])}"
+        inferred = "/".join(segments[i:]).strip("/")
+        candidate_folder = preferred_drive_path or inferred
         ok, _ = verify_sharepoint_path_reachable(
             token=token,
             site_url=candidate_site,
             drive_id=drive_id or None,
-            folder_path="",
+            folder_path=candidate_folder,
         )
         if ok:
-            inferred = "/".join(segments[i:]).strip("/")
-            resolved_path = drive_path or inferred
+            resolved_path = preferred_drive_path or inferred
             return candidate_site.rstrip("/"), resolved_path
 
     # Fall back unchanged; regular validation will return a clear error.
@@ -768,24 +772,49 @@ async def set_sharepoint_context(
         drive_path=drive_path,
         drive_id=drive_id,
     )
-    ok, msg = verify_sharepoint_path_reachable(
+    delegated_ok, delegated_msg = verify_sharepoint_path_reachable(
         token=access_token,
         site_url=site_url,
         drive_id=drive_id or None,
         folder_path=drive_path,
     )
-    if not ok:
+    if not delegated_ok:
+        # Secondary validation for diagnostics: confirms whether URL/path is valid
+        # under app credentials even when current logged-in user lacks access.
+        app_ok = False
+        app_msg = ""
+        try:
+            app_token = get_access_token()
+            app_ok, app_msg = verify_sharepoint_path_reachable(
+                token=app_token,
+                site_url=site_url,
+                drive_id=drive_id or None,
+                folder_path=drive_path,
+            )
+        except Exception as e:
+            app_msg = str(e)
+
+        if app_ok:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "URL/path looks valid under app credentials, but the logged-in user "
+                    "does not have access to this SharePoint location. "
+                    "Ask admin/site owner to grant this user access. "
+                    f"User-check details: {delegated_msg}"
+                ),
+            )
         raise HTTPException(
             status_code=400,
             detail=(
-                "SharePoint context validation failed. "
+                "SharePoint context validation failed for both user and app credentials. "
                 "Tip: paste site root in Site URL and folder-only path in Drive path. "
-                f"Details: {msg}"
+                f"User-check: {delegated_msg}. App-check: {app_msg}"
             ),
         )
     ctx = {"site_url": site_url, "drive_path": drive_path, "drive_id": drive_id}
     _save_user_context(user_id, ctx)
-    return {"status": "ok", "context": ctx, "validation": msg}
+    return {"status": "ok", "context": ctx, "validation": delegated_msg}
 
 
 @app.get("/sharepoint/browse")
