@@ -70,10 +70,12 @@ from sharepoint_utils import (
 from ai_processor import _normalize_field_value, debug_pdf_bytes, process_pdf_bytes
 from auth_utils import (
     auth_start_url,
+    clear_session_tokens,
     create_login_state,
     exchange_code_for_token,
     get_current_access_token,
     get_current_user,
+    save_session_tokens,
 )
 from user_storage import user_blob_prefix, user_paths
 
@@ -673,18 +675,14 @@ async def auth_callback(request: Request, code: Optional[str] = None, state: Opt
         "name": claims.get("name") or claims.get("preferred_username") or "User",
         "preferred_username": claims.get("preferred_username") or "",
     }
-    request.session["tokens"] = {
-        "access_token": token_result["access_token"],
-        "refresh_token": token_result.get("refresh_token"),
-        "expires_at": int(__import__("time").time()) + int(token_result.get("expires_in", 3600)),
-        "id_token_claims": claims,
-    }
+    save_session_tokens(request, token_result)
     request.session.pop("oauth_state", None)
     return RedirectResponse(url="/")
 
 
 @app.post("/auth/logout")
 async def auth_logout(request: Request):
+    clear_session_tokens(request)
     request.session.clear()
     return {"status": "ok", "message": "Logged out"}
 

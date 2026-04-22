@@ -26,6 +26,9 @@ AUTH_SCOPES = [s.strip() for s in _SCOPES_ENV.split(",") if s.strip()] if _SCOPE
     "User.Read",
     "Files.Read",
 ]
+# In-memory token store keyed by per-session ID.
+# Keeps session cookies small; avoids browser cookie-size limits with OAuth tokens.
+_SESSION_TOKEN_STORE: Dict[str, Dict[str, Any]] = {}
 
 
 def _authority() -> str:
@@ -107,9 +110,30 @@ def get_current_user(request: Request) -> Dict[str, Any]:
     return user
 
 
+def save_session_tokens(request: Request, token_result: Dict[str, Any]) -> None:
+    """Store OAuth tokens server-side and save only a small session key in cookie."""
+    sid = request.session.get("sid") or secrets.token_urlsafe(24)
+    request.session["sid"] = sid
+    claims = token_result.get("id_token_claims") or {}
+    _SESSION_TOKEN_STORE[sid] = {
+        "access_token": token_result["access_token"],
+        "refresh_token": token_result.get("refresh_token"),
+        "expires_at": int(time.time()) + int(token_result.get("expires_in", 3600)),
+        "id_token_claims": claims,
+    }
+
+
+def clear_session_tokens(request: Request) -> None:
+    sid = request.session.pop("sid", None)
+    if sid:
+        _SESSION_TOKEN_STORE.pop(sid, None)
+
+
 def get_current_access_token(request: Request) -> str:
-    tokens = request.session.get("tokens") or {}
+    sid = request.session.get("sid")
+    tokens = _SESSION_TOKEN_STORE.get(sid, {}) if sid else {}
     updated = refresh_if_needed(tokens)
-    request.session["tokens"] = updated
+    if sid:
+        _SESSION_TOKEN_STORE[sid] = updated
     return updated["access_token"]
 
