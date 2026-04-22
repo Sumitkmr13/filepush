@@ -13,6 +13,7 @@ from io import BytesIO
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Callable, Dict, Optional
+from urllib.parse import unquote, urlparse
 
 from dotenv import load_dotenv
 
@@ -168,6 +169,51 @@ def _save_user_context(user_id: str, context: dict) -> None:
     p = user_paths(user_id)["context_path"]
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(context, indent=2), encoding="utf-8")
+
+
+def _auto_resolve_sharepoint_context_from_url(
+    token: str,
+    site_url_or_full_url: str,
+    drive_path: str,
+    drive_id: str,
+) -> tuple[str, str]:
+    """
+    Make user input forgiving:
+    - Accept either site root URL or full folder/library URL in `site_url`.
+    - If a full URL is pasted and drive_path is empty, infer drive_path automatically.
+    """
+    raw = (site_url_or_full_url or "").strip()
+    parsed = urlparse(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return raw, drive_path
+
+    # Shared-link style URLs often carry real server-relative path after '/r/'.
+    path = unquote(parsed.path or "").strip("/")
+    if "/r/" in path:
+        path = path.split("/r/", 1)[1].strip("/")
+    segments = [s for s in path.split("/") if s]
+    if len(segments) <= 2:
+        return raw.rstrip("/"), drive_path
+
+    # Try longest->shortest candidate site paths and stop at first reachable site.
+    # Remaining tail becomes inferred drive_path when user didn't provide one.
+    min_site_segments = 2
+    max_checks = min(len(segments), 10)
+    for i in range(max_checks, min_site_segments - 1, -1):
+        candidate_site = f"{parsed.scheme}://{parsed.netloc}/{'/'.join(segments[:i])}"
+        ok, _ = verify_sharepoint_path_reachable(
+            token=token,
+            site_url=candidate_site,
+            drive_id=drive_id or None,
+            folder_path="",
+        )
+        if ok:
+            inferred = "/".join(segments[i:]).strip("/")
+            resolved_path = drive_path or inferred
+            return candidate_site.rstrip("/"), resolved_path
+
+    # Fall back unchanged; regular validation will return a clear error.
+    return raw.rstrip("/"), drive_path
 
 
 def _monitor_loop() -> None:
@@ -716,6 +762,12 @@ async def set_sharepoint_context(
     if not site_url:
         raise HTTPException(status_code=400, detail="site_url is required.")
     access_token = get_current_access_token(request)
+    site_url, drive_path = _auto_resolve_sharepoint_context_from_url(
+        token=access_token,
+        site_url_or_full_url=site_url,
+        drive_path=drive_path,
+        drive_id=drive_id,
+    )
     ok, msg = verify_sharepoint_path_reachable(
         token=access_token,
         site_url=site_url,
@@ -723,7 +775,14 @@ async def set_sharepoint_context(
         folder_path=drive_path,
     )
     if not ok:
-        raise HTTPException(status_code=400, detail=f"SharePoint context validation failed: {msg}")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "SharePoint context validation failed. "
+                "Tip: paste site root in Site URL and folder-only path in Drive path. "
+                f"Details: {msg}"
+            ),
+        )
     ctx = {"site_url": site_url, "drive_path": drive_path, "drive_id": drive_id}
     _save_user_context(user_id, ctx)
     return {"status": "ok", "context": ctx, "validation": msg}
@@ -1349,9 +1408,9 @@ async def read_index(request: Request):
           </button>
         </div>
         <div class="mt-3 grid grid-cols-1 md:grid-cols-3 gap-2">
-          <input id="ctxSiteUrl" type="text" placeholder="SharePoint Site URL (https://.../sites/YourSite)" class="border rounded-md px-2 py-2 text-sm" />
-          <input id="ctxDrivePath" type="text" placeholder="Drive folder path (e.g. Shared Documents/Contracts)" class="border rounded-md px-2 py-2 text-sm" />
-          <input id="ctxDriveId" type="text" placeholder="Optional Drive ID" class="border rounded-md px-2 py-2 text-sm" />
+          <input id="ctxSiteUrl" type="text" placeholder="Paste SharePoint site OR full folder URL" class="border rounded-md px-2 py-2 text-sm" />
+          <input id="ctxDrivePath" type="text" placeholder="Optional folder path (auto-derived if URL includes folder)" class="border rounded-md px-2 py-2 text-sm" />
+          <input id="ctxDriveId" type="text" placeholder="Optional Drive ID (usually leave empty)" class="border rounded-md px-2 py-2 text-sm" />
         </div>
         <div class="mt-2">
           <button onclick="saveSharePointContext()" class="px-3 py-2 rounded-md bg-slate-900 text-white hover:bg-slate-700 text-sm">
