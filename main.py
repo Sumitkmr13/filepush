@@ -67,6 +67,8 @@ from sharepoint_utils import (
     download_file_bytes,
     verify_sharepoint_path_reachable,
     get_access_token,
+    list_site_drives,
+    _get_site_id,
 )
 # Single-shot extraction: root ai_processor.py only (Gemini OCR + JSON extraction).
 from ai_processor import _normalize_field_value, debug_pdf_bytes, process_pdf_bytes
@@ -172,52 +174,105 @@ def _save_user_context(user_id: str, context: dict) -> None:
     p.write_text(json.dumps(context, indent=2), encoding="utf-8")
 
 
+def _norm_segment(s: str) -> str:
+    """Lowercase + collapse spaces for library-name comparison."""
+    return " ".join((s or "").strip().lower().split())
+
+
+def _try_resolve_split(
+    token: str,
+    scheme: str,
+    host: str,
+    segments: list,
+    i: int,
+    preferred_drive_path: str,
+    preferred_drive_id: str,
+) -> Optional[tuple]:
+    """Try (scheme://host/segments[:i]) as site; next segment as library; rest as folder path."""
+    candidate_site = f"{scheme}://{host}/{'/'.join(segments[:i])}"
+    try:
+        site_id = _get_site_id(token, site_url=candidate_site)
+    except Exception:
+        return None
+
+    tail = segments[i:]
+    drive_id = preferred_drive_id
+    folder_segments = tail
+
+    if tail and not drive_id:
+        try:
+            drives = list_site_drives(token=token, site_id=site_id)
+        except Exception:
+            drives = []
+        target = _norm_segment(tail[0])
+        for d in drives:
+            if _norm_segment(d.get("name", "")) == target:
+                drive_id = d.get("id", "") or ""
+                folder_segments = tail[1:]
+                break
+
+    folder_path = preferred_drive_path or "/".join(folder_segments).strip("/")
+    ok, _ = verify_sharepoint_path_reachable(
+        token=token,
+        site_url=candidate_site,
+        drive_id=drive_id or None,
+        folder_path=folder_path,
+    )
+    if ok:
+        return candidate_site.rstrip("/"), folder_path, drive_id
+    return None
+
+
 def _auto_resolve_sharepoint_context_from_url(
     token: str,
     site_url_or_full_url: str,
     drive_path: str,
     drive_id: str,
-) -> tuple[str, str]:
+) -> tuple:
     """
-    Make user input forgiving:
-    - Accept either site root URL or full folder/library URL in `site_url`.
-    - If a full URL is pasted and drive_path is empty, infer drive_path automatically.
+    Forgiving parser for pasted SharePoint URLs.
+    Detects site root, document library (drive) name, and folder path.
+    Falls back to app credentials from .env to parse URL structure when user token lacks access.
+    Returns (site_url, drive_path, drive_id).
     """
     raw = (site_url_or_full_url or "").strip()
     parsed = urlparse(raw)
     if not parsed.scheme or not parsed.netloc:
-        return raw, drive_path
+        return raw, drive_path, drive_id
 
-    # Shared-link style URLs often carry real server-relative path after '/r/'.
     path = unquote(parsed.path or "").strip("/")
     if "/r/" in path:
         path = path.split("/r/", 1)[1].strip("/")
     segments = [s for s in path.split("/") if s]
     if len(segments) <= 2:
-        return raw.rstrip("/"), drive_path
+        return raw.rstrip("/"), drive_path, drive_id
 
-    # Try candidate splits and validate site+folder together.
-    # This is more robust than checking site root only, because user permissions
-    # may be scoped and many pasted URLs point to deep folders/libraries.
+    preferred_drive_path = (drive_path or "").strip().strip("/")
+    preferred_drive_id = (drive_id or "").strip()
     min_site_segments = 2
     max_checks = min(len(segments), 10)
-    preferred_drive_path = (drive_path or "").strip().strip("/")
-    for i in range(max_checks, min_site_segments - 1, -1):
-        candidate_site = f"{parsed.scheme}://{parsed.netloc}/{'/'.join(segments[:i])}"
-        inferred = "/".join(segments[i:]).strip("/")
-        candidate_folder = preferred_drive_path or inferred
-        ok, _ = verify_sharepoint_path_reachable(
-            token=token,
-            site_url=candidate_site,
-            drive_id=drive_id or None,
-            folder_path=candidate_folder,
-        )
-        if ok:
-            resolved_path = preferred_drive_path or inferred
-            return candidate_site.rstrip("/"), resolved_path
 
-    # Fall back unchanged; regular validation will return a clear error.
-    return raw.rstrip("/"), drive_path
+    tokens_to_try = [token]
+    try:
+        tokens_to_try.append(get_access_token())
+    except Exception:
+        pass
+
+    for tkn in tokens_to_try:
+        for i in range(max_checks, min_site_segments - 1, -1):
+            resolved = _try_resolve_split(
+                token=tkn,
+                scheme=parsed.scheme,
+                host=parsed.netloc,
+                segments=segments,
+                i=i,
+                preferred_drive_path=preferred_drive_path,
+                preferred_drive_id=preferred_drive_id,
+            )
+            if resolved:
+                return resolved
+
+    return raw.rstrip("/"), drive_path, drive_id
 
 
 def _monitor_loop() -> None:
@@ -766,7 +821,7 @@ async def set_sharepoint_context(
     if not site_url:
         raise HTTPException(status_code=400, detail="site_url is required.")
     access_token = get_current_access_token(request)
-    site_url, drive_path = _auto_resolve_sharepoint_context_from_url(
+    site_url, drive_path, drive_id = _auto_resolve_sharepoint_context_from_url(
         token=access_token,
         site_url_or_full_url=site_url,
         drive_path=drive_path,
