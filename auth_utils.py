@@ -17,7 +17,9 @@ from config import (
 )
 
 
-AUTH_SCOPES = ["User.Read", "Sites.Read.All", "Files.Read.All", "offline_access"]
+# MSAL adds OIDC reserved scopes internally; do not pass reserved values like
+# offline_access/openid/profile here or get_authorization_request_url can fail.
+AUTH_SCOPES = ["User.Read", "Sites.Read.All", "Files.Read.All"]
 
 
 def _authority() -> str:
