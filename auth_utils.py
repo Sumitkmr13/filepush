@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import secrets
 import time
+import os
 from typing import Any, Dict, Optional
 
 from fastapi import HTTPException, Request
@@ -17,9 +18,14 @@ from config import (
 )
 
 
-# MSAL adds OIDC reserved scopes internally; do not pass reserved values like
-# offline_access/openid/profile here or get_authorization_request_url can fail.
-AUTH_SCOPES = ["User.Read", "Sites.Read.All", "Files.Read.All"]
+# Least-privilege default for delegated login. Can be overridden via env var:
+# GRAPH_DELEGATED_SCOPES=User.Read,Files.Read
+# Do not include reserved OIDC scopes (openid/profile/offline_access) here.
+_SCOPES_ENV = (os.environ.get("GRAPH_DELEGATED_SCOPES") or "").strip()
+AUTH_SCOPES = [s.strip() for s in _SCOPES_ENV.split(",") if s.strip()] if _SCOPES_ENV else [
+    "User.Read",
+    "Files.Read",
+]
 
 
 def _authority() -> str:
