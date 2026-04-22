@@ -116,7 +116,9 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 EXCEL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Background extraction state (same connection approach as check_connections; Smart Resume = state file)
-_extraction_lock = threading.Lock()
+# Re-entrant lock avoids deadlocks when helper functions that acquire the lock
+# are called from code paths that already hold the same lock.
+_extraction_lock = threading.RLock()
 _extraction_state = {
     "running": False,
     "stop_requested": False,
