@@ -4,9 +4,11 @@ Uses same connection pattern as check_connections.py (SHAREPOINT_DRIVE_ID, _reso
 Entry point: run with uvicorn or via Docker.
 """
 import asyncio
+import base64
 import json
 import logging
 import os
+import re
 import threading
 from contextlib import asynccontextmanager
 from io import BytesIO
@@ -14,6 +16,8 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import Callable, Dict, Optional
 from urllib.parse import unquote, urlparse
+
+import requests
 
 from dotenv import load_dotenv
 
@@ -30,6 +34,7 @@ import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
 from config import (
@@ -179,6 +184,67 @@ def _norm_segment(s: str) -> str:
     return " ".join((s or "").strip().lower().split())
 
 
+_SHARE_LINK_RE = re.compile(r"/:[a-zA-Z]:/")
+
+
+def _looks_like_share_link(url: str) -> bool:
+    """SharePoint 'Copy link' URLs use /:f:/, /:b:/, /:w:/, /:s:/, etc."""
+    return bool(_SHARE_LINK_RE.search(url or ""))
+
+
+def _encode_share_url(share_url: str) -> str:
+    """Encode share URL for Graph /shares/{id} per Microsoft spec."""
+    encoded = base64.urlsafe_b64encode(share_url.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"u!{encoded}"
+
+
+def _resolve_share_link_via_graph(token: str, share_url: str) -> Optional[dict]:
+    """Resolve any SharePoint share URL via Graph /shares API to a concrete drive item.
+
+    Returns dict with site_url, drive_id, drive_path. None on failure.
+    """
+    try:
+        encoded = _encode_share_url(share_url)
+        r = requests.get(
+            f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem",
+            headers={"Authorization": f"Bearer {token}", "Prefer": "redeemSharingLink"},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json() or {}
+        parent = data.get("parentReference") or {}
+        drive_id = (parent.get("driveId") or "").strip()
+        ref_path = parent.get("path") or ""
+        folder_path = ""
+        if "root:" in ref_path:
+            folder_path = ref_path.split("root:", 1)[1].strip("/")
+        item_name = (data.get("name") or "").strip()
+        if data.get("folder") and item_name:
+            folder_path = (folder_path + "/" + item_name).strip("/") if folder_path else item_name
+        web_url = (data.get("webUrl") or "").strip()
+        site_url = ""
+        if web_url:
+            wp = urlparse(web_url)
+            wpath = unquote(wp.path or "").strip("/")
+            wsegs = [s for s in wpath.split("/") if s]
+            for i in range(min(len(wsegs), 6), 1, -1):
+                candidate = f"{wp.scheme}://{wp.netloc}/{'/'.join(wsegs[:i])}"
+                try:
+                    _get_site_id(token, site_url=candidate)
+                    site_url = candidate.rstrip("/")
+                    break
+                except Exception:
+                    continue
+        return {
+            "site_url": site_url,
+            "drive_id": drive_id,
+            "drive_path": folder_path,
+        }
+    except Exception:
+        return None
+
+
 def _try_resolve_split(
     token: str,
     scheme: str,
@@ -239,6 +305,21 @@ def _auto_resolve_sharepoint_context_from_url(
     parsed = urlparse(raw)
     if not parsed.scheme or not parsed.netloc:
         return raw, drive_path, drive_id
+
+    if _looks_like_share_link(raw):
+        tokens = [token]
+        try:
+            tokens.append(get_access_token())
+        except Exception:
+            pass
+        for tkn in tokens:
+            resolved = _resolve_share_link_via_graph(tkn, raw)
+            if resolved and resolved.get("drive_id"):
+                return (
+                    resolved.get("site_url") or raw.rstrip("/"),
+                    drive_path or resolved.get("drive_path", ""),
+                    drive_id or resolved.get("drive_id", ""),
+                )
 
     path = unquote(parsed.path or "").strip("/")
     if "/r/" in path:
@@ -800,6 +881,204 @@ async def auth_me(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user
+
+
+def _ensure_debug_enabled() -> None:
+    if (os.environ.get("DEBUG_AUTH") or "").strip() != "1":
+        raise HTTPException(status_code=404, detail="Debug endpoints disabled. Set DEBUG_AUTH=1 to enable.")
+
+
+def _decode_jwt_claims(token: str) -> dict:
+    """Best-effort decode of a JWT payload. Returns parsed claims or error dict."""
+    try:
+        parts = token.split(".")
+        payload = parts[1]
+        padded = payload + "=" * (-len(payload) % 4)
+        raw = base64.urlsafe_b64decode(padded)
+        return json.loads(raw)
+    except Exception as e:
+        return {"_error": str(e)}
+
+
+def _diagnose_url_with_token(token: str, raw_url: str, folder_path: str) -> dict:
+    """Run a sequence of Graph calls and return step-by-step results."""
+    is_share = _looks_like_share_link(raw_url)
+    out: dict = {"share_link_form": is_share, "steps": []}
+
+    if is_share:
+        try:
+            encoded = _encode_share_url(raw_url)
+            r = requests.get(
+                f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem",
+                headers={"Authorization": f"Bearer {token}", "Prefer": "redeemSharingLink"},
+                timeout=30,
+            )
+            step: dict = {"action": "graph_shares", "status": r.status_code}
+            if r.status_code == 200:
+                data = r.json() or {}
+                parent = data.get("parentReference") or {}
+                step.update({
+                    "ok": True,
+                    "name": data.get("name"),
+                    "drive_id": parent.get("driveId"),
+                    "parent_path": parent.get("path"),
+                    "web_url": data.get("webUrl"),
+                    "is_folder": bool(data.get("folder")),
+                })
+            else:
+                step.update({"ok": False, "error": (r.text or "")[:300]})
+            out["steps"].append(step)
+        except Exception as e:
+            out["steps"].append({"action": "graph_shares", "ok": False, "error": str(e)})
+        return out
+
+    try:
+        site_id = _get_site_id(token, site_url=raw_url)
+        out["steps"].append({"action": "site_id", "ok": True, "site_id": site_id})
+    except Exception as e:
+        out["steps"].append({"action": "site_id", "ok": False, "error": str(e)})
+        return out
+
+    try:
+        drives = list_site_drives(token=token, site_id=site_id)
+        out["steps"].append({"action": "list_drives", "ok": True, "drives": drives[:10]})
+    except Exception as e:
+        out["steps"].append({"action": "list_drives", "ok": False, "error": str(e)})
+
+    if folder_path:
+        ok2, msg = verify_sharepoint_path_reachable(
+            token=token, site_url=raw_url, folder_path=folder_path
+        )
+        out["steps"].append({"action": "verify_path", "ok": ok2, "message": msg})
+        if ok2:
+            try:
+                items = list_contents_at_path(
+                    folder_path=folder_path, token=token, site_url=raw_url
+                )
+                sample = [
+                    {"name": i.get("name"), "is_folder": i.get("is_folder")}
+                    for i in items[:5]
+                ]
+                out["steps"].append({
+                    "action": "list_contents",
+                    "ok": True,
+                    "count": len(items),
+                    "sample": sample,
+                })
+            except Exception as e:
+                out["steps"].append({"action": "list_contents", "ok": False, "error": str(e)})
+    return out
+
+
+class DebugUrlRequest(BaseModel):
+    url: str = Field(..., description="SharePoint URL: full canonical, share-link, or site root.")
+    folder_path: Optional[str] = Field(
+        default="",
+        description="Optional folder path (used only when URL is a site root).",
+    )
+    use_app_only: bool = Field(
+        default=False,
+        description="If true, skip user token and only test with .env app credentials.",
+    )
+
+
+@app.get("/auth/debug/token", tags=["debug"])
+async def auth_debug_token(request: Request, user: dict = Depends(get_current_user)):
+    """Return current user's delegated access token. DEBUG_AUTH=1 required.
+
+    For CLI tools that prefer reading the token from a server response.
+    Disable in production.
+    """
+    _ensure_debug_enabled()
+    token = get_current_access_token(request)
+    return {"access_token": token, "user": user}
+
+
+@app.get("/debug/token-info", tags=["debug"])
+async def debug_token_info(request: Request, user: dict = Depends(get_current_user)):
+    """Decoded claims (UPN, scopes, audience, tenant) of the current session's delegated token."""
+    _ensure_debug_enabled()
+    token = get_current_access_token(request)
+    return {"user": user, "claims": _decode_jwt_claims(token)}
+
+
+@app.post("/debug/sharepoint/test-url", tags=["debug"])
+async def debug_test_sharepoint_url(
+    request: Request,
+    payload: DebugUrlRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Step-by-step diagnostic for a SharePoint URL using the logged-in user's token AND .env app credentials.
+
+    Try in /docs:
+      - paste a share-link or site URL,
+      - leave folder_path empty unless you want to verify a sub-folder,
+      - submit and read the response: each step shows ok=true/false with reason.
+    """
+    _ensure_debug_enabled()
+    raw_url = (payload.url or "").strip()
+    if not raw_url:
+        raise HTTPException(status_code=400, detail="url is required")
+
+    result: dict = {"url": raw_url, "share_link_form": _looks_like_share_link(raw_url)}
+
+    if not payload.use_app_only:
+        try:
+            user_token = get_current_access_token(request)
+            result["user_check"] = _diagnose_url_with_token(
+                user_token, raw_url, payload.folder_path or ""
+            )
+        except Exception as e:
+            result["user_check"] = {"error": f"user token unavailable: {e}"}
+
+    try:
+        app_token = get_access_token()
+        result["app_check"] = _diagnose_url_with_token(
+            app_token, raw_url, payload.folder_path or ""
+        )
+    except Exception as e:
+        result["app_check"] = {"error": f"app token unavailable: {e}"}
+
+    return result
+
+
+@app.get("/debug/app-credentials", tags=["debug"])
+async def debug_app_credentials(
+    site_url: Optional[str] = Query(
+        default=None,
+        description="Optional site URL to verify with the app token. Defaults to SHAREPOINT_SITE_URL.",
+    ),
+    user: dict = Depends(get_current_user),
+):
+    """Verify .env app credentials and optionally list drives/root contents for a site."""
+    _ensure_debug_enabled()
+    out: dict = {}
+    try:
+        token = get_access_token()
+        out["token_ok"] = True
+        out["claims"] = _decode_jwt_claims(token)
+    except Exception as e:
+        out["token_ok"] = False
+        out["error"] = str(e)
+        return out
+
+    target_site = (site_url or os.environ.get("SHAREPOINT_SITE_URL") or "").strip()
+    if target_site:
+        try:
+            site_id = _get_site_id(token, site_url=target_site)
+            out["site_id"] = site_id
+            out["drives"] = list_site_drives(token=token, site_id=site_id)
+            items = list_contents_at_path(folder_path="", token=token, site_url=target_site)
+            out["root_sample"] = [
+                {"name": i.get("name"), "is_folder": i.get("is_folder")} for i in items[:10]
+            ]
+            out["root_count"] = len(items)
+        except Exception as e:
+            out["site_error"] = str(e)
+    else:
+        out["note"] = "No site_url provided and SHAREPOINT_SITE_URL not set."
+
+    return out
 
 
 @app.get("/sharepoint/context")
