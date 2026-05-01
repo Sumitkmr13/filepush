@@ -1081,6 +1081,110 @@ async def debug_app_credentials(
     return out
 
 
+@app.get("/debug/sharepoint/list-pdfs", tags=["debug"])
+async def debug_list_pdfs(
+    request: Request,
+    use_app_only: bool = Query(default=False, description="Force app-only token even if user is logged in."),
+    user: dict = Depends(get_current_user),
+):
+    """List PDFs at the user's saved SharePoint context.
+
+    Runs the same path resolution that extraction uses, but reports each step.
+    Helps diagnose 'No PDFs found at path' errors.
+    """
+    _ensure_debug_enabled()
+    user_id = _user_id_from_claims(user)
+    ctx = _load_user_context(user_id)
+    if not ctx.get("site_url"):
+        raise HTTPException(status_code=400, detail="SharePoint context not set.")
+
+    out: dict = {"context": ctx, "tokens_tried": []}
+    site_url = ctx.get("site_url", "").strip()
+    drive_id = (ctx.get("drive_id") or "").strip() or None
+    drive_path = (ctx.get("drive_path") or "").strip().strip("/")
+
+    candidates = []
+    if not use_app_only:
+        try:
+            candidates.append(("user", get_current_access_token(request)))
+        except Exception as e:
+            out["user_token_error"] = str(e)
+    try:
+        candidates.append(("app", get_access_token()))
+    except Exception as e:
+        out["app_token_error"] = str(e)
+
+    for label, token in candidates:
+        token_result: dict = {"label": label, "steps": []}
+
+        try:
+            site_id = _get_site_id(token, site_url=site_url)
+            token_result["steps"].append({"action": "site_id", "ok": True, "site_id": site_id})
+        except Exception as e:
+            token_result["steps"].append({"action": "site_id", "ok": False, "error": str(e)})
+            out["tokens_tried"].append(token_result)
+            continue
+
+        try:
+            drives = list_site_drives(token=token, site_id=site_id)
+            token_result["steps"].append({
+                "action": "list_drives",
+                "ok": True,
+                "drives": [{"name": d.get("name"), "id": d.get("id")} for d in drives],
+            })
+        except Exception as e:
+            token_result["steps"].append({"action": "list_drives", "ok": False, "error": str(e)})
+
+        if drive_path:
+            try:
+                items = list_contents_at_path(
+                    folder_path=drive_path, token=token, drive_id=drive_id, site_url=site_url
+                )
+                token_result["steps"].append({
+                    "action": "list_contents_at_path",
+                    "ok": True,
+                    "count": len(items),
+                    "sample": [
+                        {"name": i.get("name"), "is_folder": i.get("is_folder")}
+                        for i in items[:10]
+                    ],
+                })
+            except Exception as e:
+                token_result["steps"].append({
+                    "action": "list_contents_at_path",
+                    "ok": False,
+                    "error": str(e),
+                })
+
+        try:
+            pdf_items: list = []
+            for item, dr_id in list_pdf_items_streaming(
+                access_token=token,
+                site_url=site_url,
+                drive_id=drive_id,
+                drive_path=drive_path,
+            ):
+                pdf_items.append(item)
+                if len(pdf_items) >= 50:
+                    break
+            token_result["steps"].append({
+                "action": "list_pdf_items_streaming",
+                "ok": True,
+                "count_listed": len(pdf_items),
+                "sample": [{"name": p.get("name"), "path": p.get("path")} for p in pdf_items[:10]],
+            })
+        except Exception as e:
+            token_result["steps"].append({
+                "action": "list_pdf_items_streaming",
+                "ok": False,
+                "error": str(e),
+            })
+
+        out["tokens_tried"].append(token_result)
+
+    return out
+
+
 @app.get("/sharepoint/context")
 async def get_sharepoint_context(user: dict = Depends(get_current_user)):
     user_id = _user_id_from_claims(user)
