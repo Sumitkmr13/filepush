@@ -48,6 +48,9 @@ from config import (
     INVOICE_FIELDS,
     SOW_FIELDS,
     GCS_OUTPUT_BUCKET,
+    SHAREPOINT_DRIVE_ID,
+    SHAREPOINT_DRIVE_PATH,
+    SHAREPOINT_SITE_URL,
 )
 from data_utils import (
     clean_amount,
@@ -1350,6 +1353,68 @@ async def extract_sow_start(request: Request, user: dict = Depends(get_current_u
     )
     thread.start()
     return {"status": "started", "message": "Extraction started in background. Use GET /extract-sow/status to poll; POST /extract-sow/stop to stop."}
+
+
+@app.post("/extract-sow/start-app")
+async def extract_sow_start_app(request: Request, user: dict = Depends(get_current_user)):
+    """DEBUG ONLY: run extraction with app-only Graph token and SharePoint paths from .env.
+
+    Requires DEBUG_AUTH=1. Uses SHAREPOINT_SITE_URL, SHAREPOINT_DRIVE_PATH, SHAREPOINT_DRIVE_ID
+    from environment (not the user's saved SharePoint context). Output still goes to the
+    logged-in user's per-user Excel/state paths so you can poll status and download as usual.
+
+    Disable DEBUG_AUTH in any shared or production deployment.
+    """
+    _ensure_debug_enabled()
+    if not is_sharepoint_configured():
+        raise HTTPException(status_code=400, detail="SharePoint app credentials not configured in .env.")
+    site_url = (SHAREPOINT_SITE_URL or "").strip()
+    if not site_url:
+        raise HTTPException(
+            status_code=400,
+            detail="SHAREPOINT_SITE_URL is not set in .env; cannot run app-only extraction.",
+        )
+    ctx = {
+        "site_url": site_url.rstrip("/"),
+        "drive_path": (SHAREPOINT_DRIVE_PATH or "").strip().strip("/"),
+        "drive_id": (SHAREPOINT_DRIVE_ID or "").strip(),
+    }
+    user_id = _user_id_from_claims(user)
+    try:
+        access_token = get_access_token()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to acquire app token: {e}") from e
+
+    ustate = _get_user_state(user_id)
+    with _extraction_lock:
+        if ustate["running"]:
+            return {"status": "already_running", "message": "Extraction is already running."}
+        ustate["running"] = True
+        ustate["stop_requested"] = False
+        ustate["processed_this_run"] = 0
+        ustate["total_to_process"] = 0
+        ustate["current_file"] = None
+        ustate["last_error"] = None
+    thread = threading.Thread(
+        target=_run_extraction_background,
+        kwargs={
+            "user_id": user_id,
+            "access_token": access_token,
+            "user_context": ctx,
+            "force_reprocess": False,
+        },
+        daemon=True,
+    )
+    thread.start()
+    return {
+        "status": "started",
+        "mode": "app_credentials_env_path",
+        "context_used": ctx,
+        "message": (
+            "DEBUG: extraction started with app-only token and .env SharePoint paths. "
+            "Poll GET /extract-sow/status; outputs still under your logged-in user."
+        ),
+    }
 
 
 @app.post("/extract-sow/reprocess-all")
