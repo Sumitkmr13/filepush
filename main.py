@@ -1915,9 +1915,15 @@ async def read_index(request: Request):
         <p class="text-sm text-slate-600 mt-1">Production dashboard for SharePoint document processing.</p>
         <p class="text-xs text-indigo-700 font-semibold mt-1" id="uiBuildMarker">UI v2 · single-shot extraction · auto-refresh enabled</p>
       </div>
-      <div id="systemBadge" class="inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm font-medium bg-emerald-100 text-emerald-700">
-        <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
-        System Online
+      <div class="flex flex-col items-stretch md:items-end gap-2">
+        <div id="userSessionBadge" class="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm max-w-full">
+          <span id="userSessionDot" class="w-2 h-2 rounded-full bg-slate-400 shrink-0" title="Session"></span>
+          <span id="userSessionText" class="break-all">Checking sign-in…</span>
+        </div>
+        <div id="systemBadge" class="inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm font-medium bg-emerald-100 text-emerald-700">
+          <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
+          System Online
+        </div>
       </div>
     </header>
 
@@ -1950,11 +1956,12 @@ async def read_index(request: Request):
           <input id="ctxDrivePath" type="text" placeholder="Optional folder path (auto-derived if URL includes folder)" class="border rounded-md px-2 py-2 text-sm" />
           <input id="ctxDriveId" type="text" placeholder="Optional Drive ID (usually leave empty)" class="border rounded-md px-2 py-2 text-sm" />
         </div>
-        <div class="mt-2">
-          <button onclick="saveSharePointContext()" class="px-3 py-2 rounded-md bg-slate-900 text-white hover:bg-slate-700 text-sm">
+        <div class="mt-2 flex flex-wrap items-center gap-2">
+          <button id="ctxSaveBtn" type="button" onclick="saveSharePointContext()" class="px-3 py-2 rounded-md bg-slate-900 text-white hover:bg-slate-700 text-sm disabled:opacity-60 disabled:cursor-not-allowed">
             Save SharePoint Context
           </button>
         </div>
+        <div id="ctxSaveStatus" class="text-sm mt-2 min-h-[1.25rem] text-slate-500" aria-live="polite"></div>
         <div id="scanResult" class="text-sm text-slate-600 mt-3"></div>
       </div>
 
@@ -2099,6 +2106,26 @@ async def read_index(request: Request):
       return payload;
     }
 
+    async function refreshUserSession() {
+      const textEl = document.getElementById("userSessionText");
+      const dot = document.getElementById("userSessionDot");
+      if (!textEl) return;
+      textEl.textContent = "Checking sign-in…";
+      if (dot) dot.className = "w-2 h-2 rounded-full bg-slate-400 shrink-0";
+      try {
+        const me = await apiCall("/auth/me");
+        const name = (me.name || "").trim();
+        const upn = (me.preferred_username || "").trim();
+        const label = name || upn || me.oid || "Signed in";
+        const extra = upn && upn !== name ? " · " + upn : "";
+        textEl.textContent = "Signed in: " + label + extra;
+        if (dot) dot.className = "w-2 h-2 rounded-full bg-emerald-500 shrink-0";
+      } catch (err) {
+        textEl.textContent = "Not signed in (session missing or expired).";
+        if (dot) dot.className = "w-2 h-2 rounded-full bg-amber-500 shrink-0";
+      }
+    }
+
     async function loadSharePointContext() {
       try {
         const ctx = await apiCall("/sharepoint/context");
@@ -2111,16 +2138,50 @@ async def read_index(request: Request):
     }
 
     async function saveSharePointContext() {
+      const btn = document.getElementById("ctxSaveBtn");
+      const statusEl = document.getElementById("ctxSaveStatus");
       const body = {
         site_url: document.getElementById("ctxSiteUrl").value.trim(),
         drive_path: document.getElementById("ctxDrivePath").value.trim(),
         drive_id: document.getElementById("ctxDriveId").value.trim(),
       };
+      if (!body.site_url) {
+        showToast("Enter a site URL or paste a full folder URL.", "error");
+        if (statusEl) {
+          statusEl.textContent = "Enter a URL or site address before saving.";
+          statusEl.className = "text-sm mt-2 min-h-[1.25rem] text-amber-700";
+        }
+        return;
+      }
+      if (statusEl) {
+        statusEl.textContent = "Checking SharePoint access and validating the path (this may take a few seconds)…";
+        statusEl.className = "text-sm mt-2 min-h-[1.25rem] text-sky-800 font-medium";
+      }
+      if (btn) {
+        btn.disabled = true;
+        btn.dataset.prevLabel = btn.textContent;
+        btn.textContent = "Checking access…";
+      }
       try {
         const res = await apiCall("/sharepoint/context", "POST", body);
-        showToast(res.validation || "SharePoint context saved", "ok");
+        const okMsg = (res.validation || "Context saved and verified under your account.").trim();
+        if (statusEl) {
+          statusEl.textContent = "Saved. " + okMsg;
+          statusEl.className = "text-sm mt-2 min-h-[1.25rem] text-emerald-800";
+        }
+        showToast(okMsg, "ok");
       } catch (err) {
-        showToast("Save context failed: " + err.message, "error");
+        const msg = (err && err.message) ? err.message : String(err);
+        if (statusEl) {
+          statusEl.textContent = "Could not save: " + msg.slice(0, 500);
+          statusEl.className = "text-sm mt-2 min-h-[1.25rem] text-rose-800";
+        }
+        showToast("Save context failed: " + msg.slice(0, 280), "error");
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = btn.dataset.prevLabel || "Save SharePoint Context";
+        }
       }
     }
 
@@ -2293,6 +2354,7 @@ async def read_index(request: Request):
     async function refreshAll() {
       try {
         await Promise.all([
+          refreshUserSession(),
           refreshStatus(),
           refreshStateCards(),
           refreshDownloads(),
