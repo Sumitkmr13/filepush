@@ -188,6 +188,20 @@ def _save_user_context(user_id: str, context: dict) -> None:
     p.write_text(json.dumps(context, indent=2), encoding="utf-8")
 
 
+def _clear_user_sharepoint_context_and_state(user_id: str) -> None:
+    """Remove saved SharePoint site/drive context and in-memory extraction flags for this user."""
+    if not (user_id or "").strip():
+        return
+    try:
+        p = user_paths(user_id)["context_path"]
+        if p.exists():
+            p.unlink()
+    except OSError as e:
+        logger.warning("Could not remove SharePoint context file for user: %s", e)
+    with _extraction_lock:
+        _user_extraction_state.pop(user_id, None)
+
+
 def _norm_segment(s: str) -> str:
     """Lowercase + collapse spaces for library-name comparison."""
     return " ".join((s or "").strip().lower().split())
@@ -879,6 +893,10 @@ async def auth_callback(request: Request, code: Optional[str] = None, state: Opt
 
 @app.post("/auth/logout")
 async def auth_logout(request: Request):
+    user = request.session.get("user")
+    if isinstance(user, dict) and user:
+        uid = _user_id_from_claims(user)
+        _clear_user_sharepoint_context_and_state(uid)
     clear_session_tokens(request)
     request.session.clear()
     return {"status": "ok", "message": "Logged out"}
