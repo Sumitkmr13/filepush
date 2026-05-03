@@ -23,6 +23,12 @@ from dotenv import load_dotenv
 
 # Load baked-in or local .env next to this package (e.g. /app/.env in Docker).
 load_dotenv(Path(__file__).resolve().parent / ".env")
+# Relative GOOGLE_APPLICATION_CREDENTIALS is resolved from this file's directory, not the process cwd
+# (fixes "default credentials were not found" when uvicorn/python is started from another folder).
+_app_root = Path(__file__).resolve().parent
+_gac = (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+if _gac and not Path(_gac).is_absolute():
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str((_app_root / Path(_gac)).resolve())
 # Optional: load SharePoint secrets from GCP Secret Manager into os.environ (before config is read)
 try:
     from secret_loader import load_secrets_from_gcp
