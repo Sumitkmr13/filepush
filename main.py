@@ -217,10 +217,25 @@ def _encode_share_url(share_url: str) -> str:
     return f"u!{encoded}"
 
 
+def _clean_pasted_sharepoint_path(path: str) -> str:
+    """Strip Copy-link prefixes (:f:/, /r/) so path segments are usable."""
+    path = unquote(path or "").strip().strip("/")
+    path = re.sub(r"^[a-z]:/+", "", path, flags=re.IGNORECASE)
+    if path.lower().startswith("r/"):
+        path = path[2:].lstrip("/")
+    if "/r/" in path.lower():
+        path = re.split(r"/r/", path, maxsplit=1, flags=re.IGNORECASE)[1].strip("/")
+    return path.strip("/")
+
+
+def _norm_lib_name(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+
 def _resolve_share_link_via_graph(token: str, share_url: str) -> Optional[dict]:
     """Resolve a Copy link via Graph /shares to drive_id + folder path (site_url optional)."""
     try:
-        encoded = _encode_share_url(share_url)
+        encoded = _encode_share_url(share_url.strip())
         r = requests.get(
             f"https://graph.microsoft.com/v1.0/shares/{encoded}/driveItem",
             headers={"Authorization": f"Bearer {token}", "Prefer": "redeemSharingLink"},
@@ -238,17 +253,85 @@ def _resolve_share_link_via_graph(token: str, share_url: str) -> Optional[dict]:
         drive_id = (parent.get("driveId") or "").strip()
         if not drive_id:
             return None
+        # item_id of the shared driveItem itself: used to list a folder shared from another
+        # user's OneDrive directly (the guest cannot enumerate the owner's drive root).
+        item_id = (data.get("id") or "").strip()
+        is_folder = bool(data.get("folder"))
         ref_path = parent.get("path") or ""
         folder_path = ""
         if "root:" in ref_path:
             folder_path = ref_path.split("root:", 1)[1].strip("/")
         item_name = (data.get("name") or "").strip()
-        if data.get("folder") and item_name:
+        if is_folder and item_name:
             folder_path = (folder_path + "/" + item_name).strip("/") if folder_path else item_name
-        return {"site_url": "", "drive_id": drive_id, "drive_path": folder_path}
+        site_url = ""
+        web_url = (data.get("webUrl") or "").strip()
+        if web_url:
+            wp = urlparse(web_url)
+            segs = [s for s in _clean_pasted_sharepoint_path(wp.path).split("/") if s]
+            if len(segs) >= 2 and segs[0].lower() == "personal":
+                candidate = f"{wp.scheme}://{wp.netloc}/personal/{segs[1]}".rstrip("/")
+                try:
+                    _get_site_id(token, site_url=candidate)
+                    site_url = candidate
+                except Exception:
+                    pass
+        return {
+            "site_url": site_url,
+            "drive_id": drive_id,
+            "drive_path": folder_path,
+            "item_id": item_id if is_folder else "",
+        }
     except Exception as e:
         logger.warning("Graph /shares exception: %s", e)
         return None
+
+
+def _try_resolve_copy_link_path(
+    token: str,
+    raw_url: str,
+    preferred_drive_path: str,
+    preferred_drive_id: str,
+) -> Optional[tuple]:
+    """Fallback when /shares fails: parse OneDrive Copy-link path (works for your own folders)."""
+    parsed = urlparse(raw_url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    segments = [s for s in _clean_pasted_sharepoint_path(parsed.path).split("/") if s]
+    if len(segments) < 2 or segments[0].lower() != "personal":
+        return None
+    if "-my.sharepoint.com" not in parsed.netloc.lower():
+        return None
+    site_url = f"{parsed.scheme}://{parsed.netloc}/personal/{segments[1]}".rstrip("/")
+    try:
+        site_id = _get_site_id(token, site_url=site_url)
+    except Exception:
+        return None
+    tail = segments[2:]
+    drive_id = (preferred_drive_id or "").strip()
+    folder_path = (preferred_drive_path or "").strip().strip("/")
+    if not drive_id and tail:
+        try:
+            drives = list_site_drives(token=token, site_id=site_id)
+        except Exception:
+            drives = []
+        lib = tail[0]
+        for d in drives:
+            if _norm_lib_name(d.get("name", "")) == _norm_lib_name(lib):
+                drive_id = d.get("id", "") or ""
+                tail = tail[1:]
+                break
+    if not folder_path:
+        folder_path = "/".join(tail).strip("/")
+    ok, _ = verify_sharepoint_path_reachable(
+        token=token,
+        site_url=site_url,
+        drive_id=drive_id or None,
+        folder_path=folder_path,
+    )
+    if ok:
+        return site_url, folder_path, drive_id
+    return None
 
 
 def _auto_resolve_sharepoint_context_from_url(
@@ -256,21 +339,42 @@ def _auto_resolve_sharepoint_context_from_url(
     site_url_or_full_url: str,
     drive_path: str,
     drive_id: str,
-) -> tuple:
-    """Resolve Copy links via Graph /shares; pass through canonical site URLs unchanged."""
+) -> dict:
+    """Resolve Copy links via Graph /shares, with path fallback for own OneDrive folders.
+
+    Returns dict: site_url, drive_path, drive_id, item_id (item_id set for folders shared from
+    another user's OneDrive, so we can list them directly).
+    """
     raw = (site_url_or_full_url or "").strip()
+    preferred_drive_path = (drive_path or "").strip().strip("/")
+    preferred_drive_id = (drive_id or "").strip()
+
     if _looks_like_share_link(raw):
         resolved = _resolve_share_link_via_graph(token, raw)
         if resolved and resolved.get("drive_id"):
-            return (
-                (resolved.get("site_url") or "").strip(),
-                (drive_path or resolved.get("drive_path") or "").strip().strip("/"),
-                (drive_id or resolved.get("drive_id") or "").strip(),
-            )
+            return {
+                "site_url": (resolved.get("site_url") or "").strip(),
+                "drive_path": preferred_drive_path or (resolved.get("drive_path") or "").strip().strip("/"),
+                "drive_id": preferred_drive_id or (resolved.get("drive_id") or "").strip(),
+                "item_id": (resolved.get("item_id") or "").strip(),
+            }
+        fallback = _try_resolve_copy_link_path(
+            token, raw, preferred_drive_path, preferred_drive_id
+        )
+        if fallback:
+            site_url, fb_path, fb_drive = fallback
+            return {
+                "site_url": site_url,
+                "drive_path": fb_path,
+                "drive_id": fb_drive,
+                "item_id": "",
+            }
+        return {"site_url": "", "drive_path": preferred_drive_path, "drive_id": preferred_drive_id, "item_id": ""}
+
     parsed = urlparse(raw)
     if parsed.scheme and parsed.netloc:
-        return raw.rstrip("/"), (drive_path or "").strip().strip("/"), (drive_id or "").strip()
-    return raw, drive_path, drive_id
+        return {"site_url": raw.rstrip("/"), "drive_path": preferred_drive_path, "drive_id": preferred_drive_id, "item_id": ""}
+    return {"site_url": raw, "drive_path": preferred_drive_path, "drive_id": preferred_drive_id, "item_id": ""}
 
 
 def _sharepoint_context_configured(ctx: dict) -> bool:
@@ -541,6 +645,7 @@ def _run_extraction(
     site_url = (ctx.get("site_url") or "").strip()
     drive_id_override = (ctx.get("drive_id") or "").strip() or None
     drive_path = (ctx.get("drive_path") or "").strip()
+    root_item_id = (ctx.get("item_id") or "").strip() or None
     if not drive_id_override and not site_url:
         raise RuntimeError(
             "User context is missing SharePoint location. Set it via /sharepoint/context first."
@@ -577,6 +682,7 @@ def _run_extraction(
                 site_url=site_url,
                 drive_id=drive_id_override,
                 drive_path=drive_path,
+                root_item_id=root_item_id,
             ):
                 if stop_check and stop_check():
                     logger.info("Stop requested; stopping PDF listing.")
@@ -1087,6 +1193,7 @@ async def debug_list_pdfs(
     site_url = ctx.get("site_url", "").strip()
     drive_id = (ctx.get("drive_id") or "").strip() or None
     drive_path = (ctx.get("drive_path") or "").strip().strip("/")
+    root_item_id = (ctx.get("item_id") or "").strip() or None
 
     candidates = []
     if not use_app_only:
@@ -1149,6 +1256,7 @@ async def debug_list_pdfs(
                 site_url=site_url,
                 drive_id=drive_id,
                 drive_path=drive_path,
+                root_item_id=root_item_id,
             ):
                 pdf_items.append(item)
                 if len(pdf_items) >= 50:
@@ -1190,18 +1298,25 @@ async def set_sharepoint_context(
     if not site_url:
         raise HTTPException(status_code=400, detail="site_url is required.")
     access_token = get_current_access_token(request)
-    site_url, drive_path, drive_id = _auto_resolve_sharepoint_context_from_url(
+    resolved = _auto_resolve_sharepoint_context_from_url(
         token=access_token,
         site_url_or_full_url=site_url,
         drive_path=drive_path,
         drive_id=drive_id,
     )
-    if _looks_like_share_link((payload.get("site_url") or "")) and not drive_id:
+    site_url = resolved["site_url"]
+    drive_path = resolved["drive_path"]
+    drive_id = resolved["drive_id"]
+    item_id = resolved["item_id"]
+    if _looks_like_share_link((payload.get("site_url") or "")) and not drive_id and not site_url:
         raise HTTPException(
             status_code=400,
             detail=(
-                "Could not resolve this Copy link (need drive_id from Graph /shares). "
-                "Use folder → Copy link while signed in as yourself; ensure Files.Read is granted."
+                "Could not resolve this Copy link. For your own OneDrive folder, try signing out "
+                "and back in, or paste site root "
+                "(https://tenant-my.sharepoint.com/personal/you_domain_com) in Site URL and the "
+                "folder name under Documents in Drive path. For a folder shared with you, Copy link "
+                "must work via Graph (ask IT to grant Files.Read admin consent, then sign in again)."
             ),
         )
     delegated_ok, delegated_msg = verify_sharepoint_path_reachable(
@@ -1209,6 +1324,7 @@ async def set_sharepoint_context(
         site_url=site_url or None,
         drive_id=drive_id or None,
         folder_path=drive_path,
+        root_item_id=item_id or None,
     )
     if not delegated_ok:
         # Secondary validation for diagnostics: confirms whether URL/path is valid
@@ -1222,6 +1338,7 @@ async def set_sharepoint_context(
                 site_url=site_url or None,
                 drive_id=drive_id or None,
                 folder_path=drive_path,
+                root_item_id=item_id or None,
             )
         except Exception as e:
             app_msg = str(e)
@@ -1243,7 +1360,7 @@ async def set_sharepoint_context(
                 f"User-check: {delegated_msg}. App-check: {app_msg}"
             ),
         )
-    ctx = {"site_url": site_url, "drive_path": drive_path, "drive_id": drive_id}
+    ctx = {"site_url": site_url, "drive_path": drive_path, "drive_id": drive_id, "item_id": item_id}
     _save_user_context(user_id, ctx)
     return {"status": "ok", "context": ctx, "validation": delegated_msg}
 
@@ -1570,6 +1687,7 @@ async def extract_sow_scan(request: Request, timeout: int = 300, user: dict = De
                         site_url=ctx.get("site_url", ""),
                         drive_id=(ctx.get("drive_id") or "").strip() or None,
                         drive_path=ctx.get("drive_path", ""),
+                        root_item_id=(ctx.get("item_id") or "").strip() or None,
                     ):
                         scan_queue.put((item, None))
                 except Exception as e:

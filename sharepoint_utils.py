@@ -337,13 +337,17 @@ def _list_pdfs_via_search(
 
 
 def _list_pdfs_in_drive(
-    token: str, drive_id: str, folder_path: str
+    token: str, drive_id: str, folder_path: str, root_item_id: Optional[str] = None
 ) -> List[dict]:
     """
     List all PDF items under drive path, including inside every nested subfolder.
     Path is relative to drive root (e.g. Applications List.../IT Contracts and Agreements).
     Recurses into all subfolders (e.g. project-name folders) so every PDF under the path is returned.
     Tries root:/path first; on 404, resolves path segment-by-segment.
+
+    When root_item_id is set (e.g. a folder shared from another user's OneDrive), listing starts
+    from that drive item directly instead of the drive root, since a guest may not have access to
+    the owner's drive root.
     Returns list of dicts: id (UniqueID), name, path, folder (immediate parent folder name for Excel).
     """
     base_path = (folder_path or "").strip().strip("/")
@@ -386,9 +390,12 @@ def _list_pdfs_in_drive(
         if next_link:
             recurse(next_link, current_folder_name, path_prefix)
 
-    # 1) Try direct path (root:/path:/children)
+    # 0) Shared item: list directly from the item id (no access to owner's drive root)
     start_url: Optional[str] = None
-    if base_path:
+    if root_item_id:
+        start_url = f"{GRAPH_BASE}/drives/{drive_id}/items/{root_item_id}/children"
+    # 1) Try direct path (root:/path:/children)
+    elif base_path:
         url = f"{GRAPH_BASE}/drives/{drive_id}/root:/{quote(base_path, safe='')}:/children"
         r = _graph_get_with_retry(url, token, GRAPH_REQUEST_TIMEOUT)
         if r.status_code == 404:
@@ -456,11 +463,14 @@ def _list_pdfs_in_drive(
 
 
 def _list_pdfs_in_drive_iter(
-    token: str, drive_id: str, folder_path: str
+    token: str, drive_id: str, folder_path: str, root_item_id: Optional[str] = None
 ) -> Generator[dict, None, None]:
     """
     Same as _list_pdfs_in_drive but yields PDF items as they are found (for streaming;
     processing can start while listing continues in another thread).
+
+    When root_item_id is set (folder shared from another user's OneDrive), listing starts
+    from that item id directly instead of the drive root.
     """
     base_path = (folder_path or "").strip().strip("/")
     count = 0
@@ -505,7 +515,9 @@ def _list_pdfs_in_drive_iter(
             yield from recurse(next_link, current_folder_name, path_prefix)
 
     start_url: Optional[str] = None
-    if base_path:
+    if root_item_id:
+        start_url = f"{GRAPH_BASE}/drives/{drive_id}/items/{root_item_id}/children"
+    elif base_path:
         url = f"{GRAPH_BASE}/drives/{drive_id}/root:/{quote(base_path, safe='')}:/children"
         r = _graph_get_with_retry(url, token, GRAPH_REQUEST_TIMEOUT)
         if r.status_code == 404:
@@ -733,6 +745,7 @@ def verify_sharepoint_path_reachable(
     site_url: Optional[str] = None,
     drive_id: Optional[str] = None,
     folder_path: Optional[str] = None,
+    root_item_id: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """
     Lightweight check: verify the configured drive/path is reachable and list first page only (no recursion).
@@ -740,6 +753,8 @@ def verify_sharepoint_path_reachable(
 
     When drive_id is set, uses drive-only Graph calls (required for shared OneDrive folders where the
     logged-in user is not the site owner and cannot resolve /personal/{owner} via /sites).
+    When root_item_id is set, lists that drive item directly (required for folders shared from another
+    user's OneDrive, where the guest cannot access the owner's drive root or resolve a path from root).
     Returns (success, message).
     """
     try:
@@ -752,6 +767,15 @@ def verify_sharepoint_path_reachable(
             site_id = _get_site_id(token, site_url=site_url)
             resolved_drive_id = _resolve_drive_id(token, site_id, drive_id_override=None)
         drive_id = resolved_drive_id
+        root_item_id = (root_item_id or "").strip()
+        if root_item_id:
+            url = f"{GRAPH_BASE}/drives/{drive_id}/items/{root_item_id}/children"
+            r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=GRAPH_REQUEST_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+            value = data.get("value", [])
+            summary = _format_first_page_summary(value)
+            return True, f"shared item reachable, first page: {summary}"
         if not folder_path:
             url = f"{GRAPH_BASE}/drives/{drive_id}/root/children"
             r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=GRAPH_REQUEST_TIMEOUT)
@@ -798,33 +822,38 @@ def list_pdf_items_with_drive(
     site_url: Optional[str] = None,
     drive_id: Optional[str] = None,
     drive_path: Optional[str] = None,
+    root_item_id: Optional[str] = None,
 ) -> Tuple[List[dict], str]:
     """
     List all PDF items and return (items, drive_id). Use drive_id when calling download_file_bytes.
     Uses SHAREPOINT_DRIVE_ID if set (same drive as in interactive browse), else the site's default drive.
     Uses Graph Search API first (fast, paginated); falls back to recursive folder crawl if Search fails (e.g. 404/path).
+    When root_item_id is set (folder shared from another user's OneDrive), crawls from that item id.
     """
     token = access_token or get_access_token()
     resolved_site_url = (site_url or SHAREPOINT_SITE_URL or "").strip()
     resolved_drive_id = (drive_id or "").strip()
+    root_item_id = (root_item_id or "").strip()
     if not resolved_drive_id:
         site_id = _get_site_id(token, site_url=resolved_site_url)
         resolved_drive_id = _resolve_drive_id(token, site_id, drive_id_override=None)
     folder_path = (drive_path if drive_path is not None else SHAREPOINT_DRIVE_PATH or "").strip().strip("/")
-    try:
-        items = _list_pdfs_via_search(token, resolved_drive_id, folder_path)
-        for item in items:
-            if not item.get("webUrl"):
-                item["webUrl"] = _sharepoint_file_web_url(item.get("id", ""), site_url=resolved_site_url)
-        logger.info("SharePoint: listed %s PDF(s) via Search API", len(items))
-        return items, resolved_drive_id
-    except Exception as e:
-        # Many tenants return 500 for the Graph Search API; recursive list is the reliable fallback
-        logger.info(
-            "SharePoint Search API unavailable (%s), using recursive folder list: %s",
-            type(e).__name__, e,
-        )
-    items = _list_pdfs_in_drive(token, resolved_drive_id, folder_path)
+    # Search API cannot scope to a shared item id, so skip it when listing a shared folder.
+    if not root_item_id:
+        try:
+            items = _list_pdfs_via_search(token, resolved_drive_id, folder_path)
+            for item in items:
+                if not item.get("webUrl"):
+                    item["webUrl"] = _sharepoint_file_web_url(item.get("id", ""), site_url=resolved_site_url)
+            logger.info("SharePoint: listed %s PDF(s) via Search API", len(items))
+            return items, resolved_drive_id
+        except Exception as e:
+            # Many tenants return 500 for the Graph Search API; recursive list is the reliable fallback
+            logger.info(
+                "SharePoint Search API unavailable (%s), using recursive folder list: %s",
+                type(e).__name__, e,
+            )
+    items = _list_pdfs_in_drive(token, resolved_drive_id, folder_path, root_item_id=root_item_id or None)
     for item in items:
         if not item.get("webUrl"):
             item["webUrl"] = _sharepoint_file_web_url(item.get("id", ""), site_url=resolved_site_url)
@@ -861,15 +890,19 @@ def list_pdf_items_streaming(
     site_url: Optional[str] = None,
     drive_id: Optional[str] = None,
     drive_path: Optional[str] = None,
+    root_item_id: Optional[str] = None,
 ) -> Generator[Tuple[dict, str], None, None]:
     """
     Yields (item, drive_id) as PDFs are discovered (recursive crawl). Use for extraction
     so processing can start as soon as the first PDF is found; listing continues in parallel.
     Accepts delegated user token/context for user-level permission enforcement.
+    When root_item_id is set (folder shared from another user's OneDrive), crawls from that item id
+    instead of the drive root, since the guest may not have access to the owner's drive root.
     """
     token = access_token or get_access_token()
     resolved_site_url = (site_url or SHAREPOINT_SITE_URL or "").strip()
     resolved_drive_id = (drive_id or "").strip()
+    root_item_id = (root_item_id or "").strip()
     if not resolved_drive_id:
         site_id = _get_site_id(token, site_url=resolved_site_url)
         resolved_drive_id = _resolve_drive_id(token, site_id, drive_id_override=None)
@@ -879,22 +912,24 @@ def list_pdf_items_streaming(
     # walk when search returns an empty/non-empty result that doesn't surface PDFs.
     # Microsoft Graph Search silently returns empty for OneDrive Personal with delegated
     # Files.Read scope, so we cannot rely on it as the only listing path.
-    try:
-        items = _list_pdfs_via_search(token, resolved_drive_id, folder_path)
-    except Exception:
-        items = []
-    if items:
-        for item in items:
-            if not item.get("webUrl"):
-                item["webUrl"] = _sharepoint_file_web_url(item.get("id", ""), site_url=resolved_site_url)
-            yield (item, resolved_drive_id)
-        return
-
-    if not items:
+    # Search cannot scope to a shared item id, so skip it for shared folders.
+    if not root_item_id:
+        try:
+            items = _list_pdfs_via_search(token, resolved_drive_id, folder_path)
+        except Exception:
+            items = []
+        if items:
+            for item in items:
+                if not item.get("webUrl"):
+                    item["webUrl"] = _sharepoint_file_web_url(item.get("id", ""), site_url=resolved_site_url)
+                yield (item, resolved_drive_id)
+            return
         logger.info(
             "Search API returned no PDFs (scope-limited or empty); falling back to recursive listing."
         )
-    for item in _list_pdfs_in_drive_iter(token, resolved_drive_id, folder_path):
+    for item in _list_pdfs_in_drive_iter(
+        token, resolved_drive_id, folder_path, root_item_id=root_item_id or None
+    ):
         if not item.get("webUrl"):
             item["webUrl"] = _sharepoint_file_web_url(item.get("id", ""), site_url=resolved_site_url)
         yield (item, resolved_drive_id)
