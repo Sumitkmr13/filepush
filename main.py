@@ -203,11 +203,6 @@ def _clear_user_sharepoint_context_and_state(user_id: str) -> None:
         _user_extraction_state.pop(user_id, None)
 
 
-def _norm_segment(s: str) -> str:
-    """Lowercase + collapse spaces for library-name comparison."""
-    return " ".join((s or "").strip().lower().split())
-
-
 _SHARE_LINK_RE = re.compile(r"/:[a-zA-Z]:/")
 
 
@@ -223,10 +218,7 @@ def _encode_share_url(share_url: str) -> str:
 
 
 def _resolve_share_link_via_graph(token: str, share_url: str) -> Optional[dict]:
-    """Resolve any SharePoint share URL via Graph /shares API to a concrete drive item.
-
-    Returns dict with site_url, drive_id, drive_path. None on failure.
-    """
+    """Resolve a Copy link via Graph /shares to drive_id + folder path (site_url optional)."""
     try:
         encoded = _encode_share_url(share_url)
         r = requests.get(
@@ -235,10 +227,17 @@ def _resolve_share_link_via_graph(token: str, share_url: str) -> Optional[dict]:
             timeout=30,
         )
         if r.status_code != 200:
+            logger.warning(
+                "Graph /shares failed (status=%s): %s",
+                r.status_code,
+                (r.text or "")[:200],
+            )
             return None
         data = r.json() or {}
         parent = data.get("parentReference") or {}
         drive_id = (parent.get("driveId") or "").strip()
+        if not drive_id:
+            return None
         ref_path = parent.get("path") or ""
         folder_path = ""
         if "root:" in ref_path:
@@ -246,71 +245,10 @@ def _resolve_share_link_via_graph(token: str, share_url: str) -> Optional[dict]:
         item_name = (data.get("name") or "").strip()
         if data.get("folder") and item_name:
             folder_path = (folder_path + "/" + item_name).strip("/") if folder_path else item_name
-        web_url = (data.get("webUrl") or "").strip()
-        site_url = ""
-        if web_url:
-            wp = urlparse(web_url)
-            wpath = unquote(wp.path or "").strip("/")
-            wsegs = [s for s in wpath.split("/") if s]
-            for i in range(min(len(wsegs), 6), 1, -1):
-                candidate = f"{wp.scheme}://{wp.netloc}/{'/'.join(wsegs[:i])}"
-                try:
-                    _get_site_id(token, site_url=candidate)
-                    site_url = candidate.rstrip("/")
-                    break
-                except Exception:
-                    continue
-        return {
-            "site_url": site_url,
-            "drive_id": drive_id,
-            "drive_path": folder_path,
-        }
-    except Exception:
+        return {"site_url": "", "drive_id": drive_id, "drive_path": folder_path}
+    except Exception as e:
+        logger.warning("Graph /shares exception: %s", e)
         return None
-
-
-def _try_resolve_split(
-    token: str,
-    scheme: str,
-    host: str,
-    segments: list,
-    i: int,
-    preferred_drive_path: str,
-    preferred_drive_id: str,
-) -> Optional[tuple]:
-    """Try (scheme://host/segments[:i]) as site; next segment as library; rest as folder path."""
-    candidate_site = f"{scheme}://{host}/{'/'.join(segments[:i])}"
-    try:
-        site_id = _get_site_id(token, site_url=candidate_site)
-    except Exception:
-        return None
-
-    tail = segments[i:]
-    drive_id = preferred_drive_id
-    folder_segments = tail
-
-    if tail and not drive_id:
-        try:
-            drives = list_site_drives(token=token, site_id=site_id)
-        except Exception:
-            drives = []
-        target = _norm_segment(tail[0])
-        for d in drives:
-            if _norm_segment(d.get("name", "")) == target:
-                drive_id = d.get("id", "") or ""
-                folder_segments = tail[1:]
-                break
-
-    folder_path = preferred_drive_path or "/".join(folder_segments).strip("/")
-    ok, _ = verify_sharepoint_path_reachable(
-        token=token,
-        site_url=candidate_site,
-        drive_id=drive_id or None,
-        folder_path=folder_path,
-    )
-    if ok:
-        return candidate_site.rstrip("/"), folder_path, drive_id
-    return None
 
 
 def _auto_resolve_sharepoint_context_from_url(
@@ -319,65 +257,24 @@ def _auto_resolve_sharepoint_context_from_url(
     drive_path: str,
     drive_id: str,
 ) -> tuple:
-    """
-    Forgiving parser for pasted SharePoint URLs.
-    Detects site root, document library (drive) name, and folder path.
-    Falls back to app credentials from .env to parse URL structure when user token lacks access.
-    Returns (site_url, drive_path, drive_id).
-    """
+    """Resolve Copy links via Graph /shares; pass through canonical site URLs unchanged."""
     raw = (site_url_or_full_url or "").strip()
-    parsed = urlparse(raw)
-    if not parsed.scheme or not parsed.netloc:
-        return raw, drive_path, drive_id
-
     if _looks_like_share_link(raw):
-        tokens = [token]
-        try:
-            tokens.append(get_access_token())
-        except Exception:
-            pass
-        for tkn in tokens:
-            resolved = _resolve_share_link_via_graph(tkn, raw)
-            if resolved and resolved.get("drive_id"):
-                return (
-                    resolved.get("site_url") or raw.rstrip("/"),
-                    drive_path or resolved.get("drive_path", ""),
-                    drive_id or resolved.get("drive_id", ""),
-                )
-
-    path = unquote(parsed.path or "").strip("/")
-    if "/r/" in path:
-        path = path.split("/r/", 1)[1].strip("/")
-    segments = [s for s in path.split("/") if s]
-    if len(segments) <= 2:
-        return raw.rstrip("/"), drive_path, drive_id
-
-    preferred_drive_path = (drive_path or "").strip().strip("/")
-    preferred_drive_id = (drive_id or "").strip()
-    min_site_segments = 2
-    max_checks = min(len(segments), 10)
-
-    tokens_to_try = [token]
-    try:
-        tokens_to_try.append(get_access_token())
-    except Exception:
-        pass
-
-    for tkn in tokens_to_try:
-        for i in range(max_checks, min_site_segments - 1, -1):
-            resolved = _try_resolve_split(
-                token=tkn,
-                scheme=parsed.scheme,
-                host=parsed.netloc,
-                segments=segments,
-                i=i,
-                preferred_drive_path=preferred_drive_path,
-                preferred_drive_id=preferred_drive_id,
+        resolved = _resolve_share_link_via_graph(token, raw)
+        if resolved and resolved.get("drive_id"):
+            return (
+                (resolved.get("site_url") or "").strip(),
+                (drive_path or resolved.get("drive_path") or "").strip().strip("/"),
+                (drive_id or resolved.get("drive_id") or "").strip(),
             )
-            if resolved:
-                return resolved
+    parsed = urlparse(raw)
+    if parsed.scheme and parsed.netloc:
+        return raw.rstrip("/"), (drive_path or "").strip().strip("/"), (drive_id or "").strip()
+    return raw, drive_path, drive_id
 
-    return raw.rstrip("/"), drive_path, drive_id
+
+def _sharepoint_context_configured(ctx: dict) -> bool:
+    return bool((ctx.get("drive_id") or "").strip() or (ctx.get("site_url") or "").strip())
 
 
 def _monitor_loop() -> None:
@@ -644,8 +541,10 @@ def _run_extraction(
     site_url = (ctx.get("site_url") or "").strip()
     drive_id_override = (ctx.get("drive_id") or "").strip() or None
     drive_path = (ctx.get("drive_path") or "").strip()
-    if not site_url:
-        raise RuntimeError("User context is missing SharePoint site_url. Set it via /sharepoint/context first.")
+    if not drive_id_override and not site_url:
+        raise RuntimeError(
+            "User context is missing SharePoint location. Set it via /sharepoint/context first."
+        )
     upaths = user_paths(user_id)
     state_path = upaths["state_path"]
     excel_sow_path = upaths["excel_sow_path"]
@@ -1181,7 +1080,7 @@ async def debug_list_pdfs(
     _ensure_debug_enabled()
     user_id = _user_id_from_claims(user)
     ctx = _load_user_context(user_id)
-    if not ctx.get("site_url"):
+    if not _sharepoint_context_configured(ctx):
         raise HTTPException(status_code=400, detail="SharePoint context not set.")
 
     out: dict = {"context": ctx, "tokens_tried": []}
@@ -1203,23 +1102,24 @@ async def debug_list_pdfs(
     for label, token in candidates:
         token_result: dict = {"label": label, "steps": []}
 
-        try:
-            site_id = _get_site_id(token, site_url=site_url)
-            token_result["steps"].append({"action": "site_id", "ok": True, "site_id": site_id})
-        except Exception as e:
-            token_result["steps"].append({"action": "site_id", "ok": False, "error": str(e)})
-            out["tokens_tried"].append(token_result)
-            continue
+        if site_url:
+            try:
+                site_id = _get_site_id(token, site_url=site_url)
+                token_result["steps"].append({"action": "site_id", "ok": True, "site_id": site_id})
+            except Exception as e:
+                token_result["steps"].append({"action": "site_id", "ok": False, "error": str(e)})
+                out["tokens_tried"].append(token_result)
+                continue
 
-        try:
-            drives = list_site_drives(token=token, site_id=site_id)
-            token_result["steps"].append({
-                "action": "list_drives",
-                "ok": True,
-                "drives": [{"name": d.get("name"), "id": d.get("id")} for d in drives],
-            })
-        except Exception as e:
-            token_result["steps"].append({"action": "list_drives", "ok": False, "error": str(e)})
+            try:
+                drives = list_site_drives(token=token, site_id=site_id)
+                token_result["steps"].append({
+                    "action": "list_drives",
+                    "ok": True,
+                    "drives": [{"name": d.get("name"), "id": d.get("id")} for d in drives],
+                })
+            except Exception as e:
+                token_result["steps"].append({"action": "list_drives", "ok": False, "error": str(e)})
 
         if drive_path:
             try:
@@ -1296,9 +1196,17 @@ async def set_sharepoint_context(
         drive_path=drive_path,
         drive_id=drive_id,
     )
+    if _looks_like_share_link((payload.get("site_url") or "")) and not drive_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Could not resolve this Copy link (need drive_id from Graph /shares). "
+                "Use folder → Copy link while signed in as yourself; ensure Files.Read is granted."
+            ),
+        )
     delegated_ok, delegated_msg = verify_sharepoint_path_reachable(
         token=access_token,
-        site_url=site_url,
+        site_url=site_url or None,
         drive_id=drive_id or None,
         folder_path=drive_path,
     )
@@ -1311,7 +1219,7 @@ async def set_sharepoint_context(
             app_token = get_access_token()
             app_ok, app_msg = verify_sharepoint_path_reachable(
                 token=app_token,
-                site_url=site_url,
+                site_url=site_url or None,
                 drive_id=drive_id or None,
                 folder_path=drive_path,
             )
@@ -1332,7 +1240,6 @@ async def set_sharepoint_context(
             status_code=400,
             detail=(
                 "SharePoint context validation failed for both user and app credentials. "
-                "Tip: paste site root in Site URL and folder-only path in Drive path. "
                 f"User-check: {delegated_msg}. App-check: {app_msg}"
             ),
         )
@@ -1349,9 +1256,9 @@ async def browse_sharepoint(
 ):
     user_id = _user_id_from_claims(user)
     ctx = _load_user_context(user_id)
-    site_url = (ctx.get("site_url") or "").strip()
-    if not site_url:
+    if not _sharepoint_context_configured(ctx):
         raise HTTPException(status_code=400, detail="SharePoint context not set. Call /sharepoint/context first.")
+    site_url = (ctx.get("site_url") or "").strip() or None
     access_token = get_current_access_token(request)
     items = list_contents_at_path(
         folder_path=folder_path,
@@ -1377,7 +1284,7 @@ async def extract_sow(
         user_id = _user_id_from_claims(user)
         access_token = get_current_access_token(request)
         ctx = _load_user_context(user_id)
-        if not ctx.get("site_url"):
+        if not _sharepoint_context_configured(ctx):
             raise HTTPException(status_code=400, detail="SharePoint context not set. Call /sharepoint/context first.")
         loop = asyncio.get_event_loop()
         new_count, total_count, output_path = await loop.run_in_executor(
@@ -1416,7 +1323,7 @@ async def extract_sow_start(request: Request, user: dict = Depends(get_current_u
     """Start extraction in background. Resumes from state (skips already-processed PDFs). Use GET /extract-sow/status to poll; POST /extract-sow/stop to stop."""
     user_id = _user_id_from_claims(user)
     ctx = _load_user_context(user_id)
-    if not ctx.get("site_url"):
+    if not _sharepoint_context_configured(ctx):
         raise HTTPException(status_code=400, detail="SharePoint context not set. Call /sharepoint/context first.")
     access_token = get_current_access_token(request)
     ustate = _get_user_state(user_id)
@@ -1508,7 +1415,7 @@ async def extract_sow_reprocess_all(request: Request, user: dict = Depends(get_c
     """
     user_id = _user_id_from_claims(user)
     ctx = _load_user_context(user_id)
-    if not ctx.get("site_url"):
+    if not _sharepoint_context_configured(ctx):
         raise HTTPException(status_code=400, detail="SharePoint context not set. Call /sharepoint/context first.")
     access_token = get_current_access_token(request)
     ustate = _get_user_state(user_id)
@@ -1644,7 +1551,7 @@ async def extract_sow_scan(request: Request, timeout: int = 300, user: dict = De
     try:
         user_id = _user_id_from_claims(user)
         ctx = _load_user_context(user_id)
-        if not ctx.get("site_url"):
+        if not _sharepoint_context_configured(ctx):
             raise HTTPException(status_code=400, detail="SharePoint context not set. Call /sharepoint/context first.")
         access_token = get_current_access_token(request)
         state_path = user_paths(user_id)["state_path"]
