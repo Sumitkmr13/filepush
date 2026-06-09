@@ -504,26 +504,16 @@ def _write_excel(
         for col in new_df.columns:
             if col in _AMOUNT_COLS:
                 new_df[col] = new_df[col].apply(clean_amount)
-        # Replace stale rows when the same file is reprocessed.
+        # Replace stale rows when the same file is reprocessed (by Filename only so a
+        # moved/copied file does not leave duplicate rows under different URLs).
         if not df.empty:
-            new_keys = set(
-                zip(
-                    new_df["Filename"].astype(str).str.strip(),
-                    new_df[_URL_KEY].astype(str).str.strip(),
-                )
-            )
-            if new_keys:
-                existing_keys = list(
-                    zip(
-                        df["Filename"].astype(str).str.strip(),
-                        df[_URL_KEY].astype(str).str.strip(),
-                    )
-                )
-                keep_mask = [k not in new_keys for k in existing_keys]
-                replaced = len(df) - sum(keep_mask)
+            new_filenames = set(new_df["Filename"].astype(str).str.strip())
+            if new_filenames:
+                keep_mask = ~df["Filename"].astype(str).str.strip().isin(new_filenames)
+                replaced = int((~keep_mask).sum())
                 if replaced > 0:
                     logger.info(
-                        "Replacing %s existing row(s) for reprocessed files in %s.",
+                        "Replacing %s existing row(s) for reprocessed filename(s) in %s.",
                         replaced,
                         excel_path.name,
                     )
