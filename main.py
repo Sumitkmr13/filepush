@@ -92,6 +92,7 @@ from auth_utils import (
     clear_session_tokens,
     create_login_state,
     exchange_code_for_token,
+    get_access_token_for_session,
     get_current_access_token,
     get_current_user,
     save_session_tokens,
@@ -175,6 +176,17 @@ def _get_user_state(user_id: str) -> dict:
 
 def _load_user_context(user_id: str) -> dict:
     p = user_paths(user_id)["context_path"]
+    if not p.exists() and GCS_OUTPUT_BUCKET:
+        # Cloud Run disk is ephemeral: restore the saved context from GCS after a restart
+        # so users do not have to re-save their SharePoint location on every new instance.
+        try:
+            from gcs_utils import download_file_from_bucket
+            p.parent.mkdir(parents=True, exist_ok=True)
+            blob = f"{user_blob_prefix(user_id)}/{p.name}"
+            if download_file_from_bucket(GCS_OUTPUT_BUCKET, blob, p):
+                logger.info("SharePoint context restored from GCS for user.")
+        except Exception as e:
+            logger.warning("Could not restore SharePoint context from GCS: %s", e)
     if not p.exists():
         return {}
     try:
@@ -187,6 +199,13 @@ def _save_user_context(user_id: str, context: dict) -> None:
     p = user_paths(user_id)["context_path"]
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(context, indent=2), encoding="utf-8")
+    if GCS_OUTPUT_BUCKET:
+        try:
+            from gcs_utils import upload_file_to_bucket
+            blob = f"{user_blob_prefix(user_id)}/{p.name}"
+            upload_file_to_bucket(p, GCS_OUTPUT_BUCKET, blob_name=blob)
+        except Exception as e:
+            logger.warning("Could not upload SharePoint context to GCS: %s", e)
 
 
 def _clear_user_sharepoint_context_and_state(user_id: str) -> None:
@@ -271,50 +290,20 @@ def _resolve_share_link_via_graph(token: str, share_url: str) -> Optional[dict]:
             segs = [s for s in _clean_pasted_sharepoint_path(wp.path).split("/") if s]
             if len(segs) >= 2 and segs[0].lower() == "personal":
                 candidate = f"{wp.scheme}://{wp.netloc}/personal/{segs[1]}".rstrip("/")
-            elif len(segs) >= 3 and segs[0].lower() == "teams":
-                candidate = f"{wp.scheme}://{wp.netloc}/teams/{segs[1]}/{segs[2]}".rstrip("/")
-            elif len(segs) >= 2 and segs[0].lower() == "sites":
-                candidate = f"{wp.scheme}://{wp.netloc}/sites/{segs[1]}".rstrip("/")
-            else:
-                candidate = ""
-            if candidate:
                 try:
                     _get_site_id(token, site_url=candidate)
                     site_url = candidate
                 except Exception:
                     pass
-        # Keep item_id for folder shares even when Graph omits the folder facet on some tenants.
-        list_from_item_id = item_id and (is_folder or data.get("file") is None)
         return {
             "site_url": site_url,
             "drive_id": drive_id,
             "drive_path": folder_path,
-            "item_id": item_id if list_from_item_id else "",
+            "item_id": item_id if is_folder else "",
         }
     except Exception as e:
         logger.warning("Graph /shares exception: %s", e)
         return None
-
-
-def _match_drive_for_library(
-    token: str,
-    site_id: str,
-    tail: list,
-    preferred_drive_id: str,
-) -> tuple:
-    """Return (drive_id, remaining_path_segments) matching a document library name when possible."""
-    drive_id = (preferred_drive_id or "").strip()
-    if drive_id or not tail:
-        return drive_id, tail
-    try:
-        drives = list_site_drives(token=token, site_id=site_id)
-    except Exception:
-        drives = []
-    lib = tail[0]
-    for d in drives:
-        if _norm_lib_name(d.get("name", "")) == _norm_lib_name(lib):
-            return (d.get("id", "") or "").strip(), tail[1:]
-    return "", tail
 
 
 def _try_resolve_copy_link_path(
@@ -322,41 +311,37 @@ def _try_resolve_copy_link_path(
     raw_url: str,
     preferred_drive_path: str,
     preferred_drive_id: str,
-) -> Optional[dict]:
-    """Fallback when /shares fails: parse Copy-link URL path (OneDrive, Teams, or Sites)."""
+) -> Optional[tuple]:
+    """Fallback when /shares fails: parse OneDrive Copy-link path (works for your own folders)."""
     parsed = urlparse(raw_url)
     if not parsed.scheme or not parsed.netloc:
         return None
     segments = [s for s in _clean_pasted_sharepoint_path(parsed.path).split("/") if s]
-    if len(segments) < 2:
+    if len(segments) < 2 or segments[0].lower() != "personal":
         return None
-
-    site_url = ""
-    tail: list = []
-    if segments[0].lower() == "personal":
-        if "-my.sharepoint.com" not in parsed.netloc.lower() or len(segments) < 2:
-            return None
-        site_url = f"{parsed.scheme}://{parsed.netloc}/personal/{segments[1]}".rstrip("/")
-        tail = segments[2:]
-    elif segments[0].lower() == "teams" and len(segments) >= 4:
-        site_url = f"{parsed.scheme}://{parsed.netloc}/teams/{segments[1]}/{segments[2]}".rstrip("/")
-        tail = segments[3:]
-    elif segments[0].lower() == "sites" and len(segments) >= 3:
-        site_url = f"{parsed.scheme}://{parsed.netloc}/sites/{segments[1]}".rstrip("/")
-        tail = segments[2:]
-    else:
+    if "-my.sharepoint.com" not in parsed.netloc.lower():
         return None
-
+    site_url = f"{parsed.scheme}://{parsed.netloc}/personal/{segments[1]}".rstrip("/")
     try:
         site_id = _get_site_id(token, site_url=site_url)
     except Exception:
         return None
-
-    drive_id, tail = _match_drive_for_library(token, site_id, tail, preferred_drive_id)
+    tail = segments[2:]
+    drive_id = (preferred_drive_id or "").strip()
     folder_path = (preferred_drive_path or "").strip().strip("/")
+    if not drive_id and tail:
+        try:
+            drives = list_site_drives(token=token, site_id=site_id)
+        except Exception:
+            drives = []
+        lib = tail[0]
+        for d in drives:
+            if _norm_lib_name(d.get("name", "")) == _norm_lib_name(lib):
+                drive_id = d.get("id", "") or ""
+                tail = tail[1:]
+                break
     if not folder_path:
         folder_path = "/".join(tail).strip("/")
-
     ok, _ = verify_sharepoint_path_reachable(
         token=token,
         site_url=site_url,
@@ -364,12 +349,7 @@ def _try_resolve_copy_link_path(
         folder_path=folder_path,
     )
     if ok:
-        return {
-            "site_url": site_url,
-            "drive_path": folder_path,
-            "drive_id": drive_id,
-            "item_id": "",
-        }
+        return site_url, folder_path, drive_id
     return None
 
 
@@ -401,7 +381,13 @@ def _auto_resolve_sharepoint_context_from_url(
             token, raw, preferred_drive_path, preferred_drive_id
         )
         if fallback:
-            return fallback
+            site_url, fb_path, fb_drive = fallback
+            return {
+                "site_url": site_url,
+                "drive_path": fb_path,
+                "drive_id": fb_drive,
+                "item_id": "",
+            }
         return {"site_url": "", "drive_path": preferred_drive_path, "drive_id": preferred_drive_id, "item_id": ""}
 
     parsed = urlparse(raw)
@@ -648,6 +634,7 @@ def _run_extraction(
     user_id: str = "global",
     access_token: Optional[str] = None,
     user_context: Optional[dict] = None,
+    token_provider: Optional[Callable[[], str]] = None,
 ):
     """
     Stream PDFs from SharePoint (listing in background); process each as soon as it arrives.
@@ -659,6 +646,17 @@ def _run_extraction(
     if not is_sharepoint_configured():
         logger.warning("SharePoint not configured; no PDF source")
         return 0, 0, None
+
+    def _fresh_token() -> Optional[str]:
+        """Current delegated token, refreshed via the session refresh token when possible.
+        Long runs (> ~1 hour) would otherwise 401 on Graph downloads with the token
+        captured at job start."""
+        if token_provider is not None:
+            try:
+                return token_provider()
+            except Exception as e:
+                logger.warning("Delegated token refresh failed; using token from job start: %s", e)
+        return access_token
 
     ustate = _get_user_state(user_id)
     with _extraction_lock:
@@ -701,7 +699,7 @@ def _run_extraction(
     def producer() -> None:
         try:
             for item, drive_id in list_pdf_items_streaming(
-                access_token=access_token,
+                access_token=_fresh_token(),
                 site_url=site_url,
                 drive_id=drive_id_override,
                 drive_path=drive_path,
@@ -776,7 +774,7 @@ def _run_extraction(
             ustate["last_error"] = None
         logger.info("[%s] Downloading: %s (%s)", idx, short_name, folder_name or "root")
         try:
-            pdf_bytes = download_file_bytes(it["id"], drive_id=drive_id, access_token=access_token, site_url=site_url)
+            pdf_bytes = download_file_bytes(it["id"], drive_id=drive_id, access_token=_fresh_token(), site_url=site_url)
             size_kb = len(pdf_bytes) / 1024
             logger.info("[%s] Downloaded %s (%.1f KB). Extracting fields (single-shot)...", idx, short_name, size_kb)
             rows = process_pdf_bytes(pdf_bytes, folder_name=folder_name, file_name=short_name)
@@ -918,13 +916,22 @@ def _run_extraction_background(
     access_token: str,
     user_context: dict,
     force_reprocess: bool = False,
+    session_id: Optional[str] = None,
 ) -> None:
-    """Run extraction in background; updates _extraction_state. Uses stop_check so stop saves Excel + GCS."""
+    """Run extraction in background; updates _extraction_state. Uses stop_check so stop saves Excel + GCS.
+
+    When session_id is provided, the job refreshes the delegated Graph token from the
+    session store as needed, so runs longer than the ~1 hour token lifetime keep working.
+    """
     ustate = _get_user_state(user_id)
 
     def stop_check() -> bool:
         with _extraction_lock:
             return ustate["stop_requested"]
+
+    token_provider: Optional[Callable[[], str]] = None
+    if session_id:
+        token_provider = lambda: get_access_token_for_session(session_id)  # noqa: E731
 
     logger.info("Background extraction job started (force_reprocess=%s).", force_reprocess)
     try:
@@ -937,6 +944,7 @@ def _run_extraction_background(
             user_id=user_id,
             access_token=access_token,
             user_context=user_context,
+            token_provider=token_provider,
         )
         with _extraction_lock:
             ustate["total_in_excel"] = total_count
@@ -980,20 +988,23 @@ async def auth_callback(request: Request, code: Optional[str] = None, state: Opt
 
 @app.post("/auth/logout")
 async def auth_logout(request: Request):
+    # Do NOT delete the saved SharePoint context here: it is keyed to the user identity
+    # (oid) and must survive logout/login, otherwise every re-login (e.g. after token
+    # expiry) forces the user to re-save their SharePoint location.
     user = request.session.get("user")
     if isinstance(user, dict) and user:
         uid = _user_id_from_claims(user)
-        _clear_user_sharepoint_context_and_state(uid)
+        with _extraction_lock:
+            _user_extraction_state.pop(uid, None)
     clear_session_tokens(request)
     request.session.clear()
     return {"status": "ok", "message": "Logged out"}
 
 
 @app.get("/auth/me")
-async def auth_me(request: Request):
-    user = request.session.get("user")
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+async def auth_me(request: Request, user: dict = Depends(get_current_user)):
+    # get_current_user also verifies the server-side token store still holds this
+    # session's tokens, so a restarted instance reports 401 instead of a fake login.
     return user
 
 
@@ -1354,18 +1365,17 @@ async def set_sharepoint_context(
         # under app credentials even when current logged-in user lacks access.
         app_ok = False
         app_msg = ""
-        if not drive_id:
-            try:
-                app_token = get_access_token()
-                app_ok, app_msg = verify_sharepoint_path_reachable(
-                    token=app_token,
-                    site_url=site_url or None,
-                    drive_id=drive_id or None,
-                    folder_path=drive_path,
-                    root_item_id=item_id or None,
-                )
-            except Exception as e:
-                app_msg = str(e)
+        try:
+            app_token = get_access_token()
+            app_ok, app_msg = verify_sharepoint_path_reachable(
+                token=app_token,
+                site_url=site_url or None,
+                drive_id=drive_id or None,
+                folder_path=drive_path,
+                root_item_id=item_id or None,
+            )
+        except Exception as e:
+            app_msg = str(e)
 
         if app_ok:
             raise HTTPException(
@@ -1375,17 +1385,6 @@ async def set_sharepoint_context(
                     "does not have access to this SharePoint location. "
                     "Ask admin/site owner to grant this user access. "
                     f"User-check details: {delegated_msg}"
-                ),
-            )
-        if drive_id:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "SharePoint validation failed for your signed-in account. "
-                    f"Details: {delegated_msg}. "
-                    "Check: (1) Drive ID is the document library that contains the folder, "
-                    "(2) Drive path is relative to that library root (do not repeat the library name), "
-                    "(3) you can open the same folder in SharePoint while signed in as this user."
                 ),
             )
         raise HTTPException(
@@ -1438,6 +1437,7 @@ async def extract_sow(
         ctx = _load_user_context(user_id)
         if not _sharepoint_context_configured(ctx):
             raise HTTPException(status_code=400, detail="SharePoint context not set. Call /sharepoint/context first.")
+        sid = request.session.get("sid")
         loop = asyncio.get_event_loop()
         new_count, total_count, output_path = await loop.run_in_executor(
             None,
@@ -1447,6 +1447,7 @@ async def extract_sow(
                 user_id=user_id,
                 access_token=access_token,
                 user_context=ctx,
+                token_provider=(lambda: get_access_token_for_session(sid)) if sid else None,
             ),
         )
     except Exception as e:
@@ -1490,7 +1491,13 @@ async def extract_sow_start(request: Request, user: dict = Depends(get_current_u
         ustate["last_error"] = None
     thread = threading.Thread(
         target=_run_extraction_background,
-        kwargs={"user_id": user_id, "access_token": access_token, "user_context": ctx, "force_reprocess": False},
+        kwargs={
+            "user_id": user_id,
+            "access_token": access_token,
+            "user_context": ctx,
+            "force_reprocess": False,
+            "session_id": request.session.get("sid"),
+        },
         daemon=True,
     )
     thread.start()
@@ -1582,7 +1589,13 @@ async def extract_sow_reprocess_all(request: Request, user: dict = Depends(get_c
         ustate["last_error"] = None
     thread = threading.Thread(
         target=_run_extraction_background,
-        kwargs={"user_id": user_id, "access_token": access_token, "user_context": ctx, "force_reprocess": True},
+        kwargs={
+            "user_id": user_id,
+            "access_token": access_token,
+            "user_context": ctx,
+            "force_reprocess": True,
+            "session_id": request.session.get("sid"),
+        },
         daemon=True,
     )
     thread.start()
