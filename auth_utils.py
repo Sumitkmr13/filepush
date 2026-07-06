@@ -174,6 +174,26 @@ def get_access_token_for_session(sid: Optional[str]) -> str:
     return updated["access_token"]
 
 
+def snapshot_session_tokens(request: Request) -> Optional[Dict[str, Any]]:
+    """Private copy of the session's tokens for a background job.
+
+    The job refreshes this copy independently of the session store, so a logout
+    (accidental or deliberate) while a run is in progress does not break the run:
+    logout only clears the server-side session; the refresh token in the snapshot
+    stays valid at Microsoft until it expires or is revoked by the tenant.
+    """
+    sid = request.session.get("sid")
+    tokens = _SESSION_TOKEN_STORE.get(sid or "")
+    return dict(tokens) if tokens else None
+
+
+def get_access_token_from_snapshot(snapshot: Dict[str, Any]) -> str:
+    """Fresh access token from a job-owned token snapshot; refreshes it in place."""
+    updated = refresh_if_needed(snapshot)
+    snapshot.update(updated)
+    return updated["access_token"]
+
+
 def get_current_access_token(request: Request) -> str:
     return get_access_token_for_session(request.session.get("sid"))
 
