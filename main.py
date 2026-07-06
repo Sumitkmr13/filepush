@@ -105,7 +105,15 @@ from user_storage import user_blob_prefix, user_paths
 # can be re-applied when the Excel is reloaded on subsequent runs.
 _URL_KEY = "SharePoint URL"
 
-logging.basicConfig(level=logging.INFO)
+# force=True: several imported libraries (Google/Vertex SDKs) install their own root
+# handler on import, which turns a plain basicConfig() into a silent no-op and drops
+# all INFO logs (login, extraction progress, per-file lines). force=True replaces any
+# such handler so app logs always reach stdout/stderr (and Cloud Logging on Cloud Run).
+logging.basicConfig(
+    level=(os.environ.get("LOG_LEVEL") or "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -986,6 +994,11 @@ async def auth_callback(request: Request, code: Optional[str] = None, state: Opt
     }
     save_session_tokens(request, token_result)
     request.session.pop("oauth_state", None)
+    logger.info(
+        "User logged in: %s (%s)",
+        claims.get("preferred_username") or "unknown",
+        claims.get("name") or "",
+    )
     return RedirectResponse(url="/")
 
 
@@ -997,6 +1010,8 @@ async def auth_logout(request: Request):
     # - run status: a background job may still be running (it holds its own token
     #   snapshot), and after re-login the same user must see its progress and be
     #   able to stop it.
+    user = request.session.get("user") or {}
+    logger.info("User logged out: %s", user.get("preferred_username") or user.get("name") or "unknown")
     clear_session_tokens(request)
     request.session.clear()
     return {"status": "ok", "message": "Logged out"}
