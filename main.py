@@ -92,10 +92,11 @@ from auth_utils import (
     clear_session_tokens,
     create_login_state,
     exchange_code_for_token,
-    get_access_token_for_session,
+    get_access_token_from_snapshot,
     get_current_access_token,
     get_current_user,
     save_session_tokens,
+    snapshot_session_tokens,
 )
 from user_storage import user_blob_prefix, user_paths
 
@@ -916,12 +917,14 @@ def _run_extraction_background(
     access_token: str,
     user_context: dict,
     force_reprocess: bool = False,
-    session_id: Optional[str] = None,
+    token_snapshot: Optional[dict] = None,
 ) -> None:
     """Run extraction in background; updates _extraction_state. Uses stop_check so stop saves Excel + GCS.
 
-    When session_id is provided, the job refreshes the delegated Graph token from the
-    session store as needed, so runs longer than the ~1 hour token lifetime keep working.
+    When token_snapshot is provided (a private copy of the session's tokens), the job
+    refreshes the delegated Graph token from it as needed, so runs longer than the
+    ~1 hour token lifetime keep working — even if the user logs out mid-run, since the
+    snapshot is independent of the session store.
     """
     ustate = _get_user_state(user_id)
 
@@ -930,8 +933,8 @@ def _run_extraction_background(
             return ustate["stop_requested"]
 
     token_provider: Optional[Callable[[], str]] = None
-    if session_id:
-        token_provider = lambda: get_access_token_for_session(session_id)  # noqa: E731
+    if token_snapshot:
+        token_provider = lambda: get_access_token_from_snapshot(token_snapshot)  # noqa: E731
 
     logger.info("Background extraction job started (force_reprocess=%s).", force_reprocess)
     try:
@@ -988,14 +991,12 @@ async def auth_callback(request: Request, code: Optional[str] = None, state: Opt
 
 @app.post("/auth/logout")
 async def auth_logout(request: Request):
-    # Do NOT delete the saved SharePoint context here: it is keyed to the user identity
-    # (oid) and must survive logout/login, otherwise every re-login (e.g. after token
-    # expiry) forces the user to re-save their SharePoint location.
-    user = request.session.get("user")
-    if isinstance(user, dict) and user:
-        uid = _user_id_from_claims(user)
-        with _extraction_lock:
-            _user_extraction_state.pop(uid, None)
+    # Do NOT delete the saved SharePoint context or the in-memory run status here.
+    # Both are keyed to the user identity (oid) and must survive logout/login:
+    # - context: otherwise every re-login forces re-saving the SharePoint location;
+    # - run status: a background job may still be running (it holds its own token
+    #   snapshot), and after re-login the same user must see its progress and be
+    #   able to stop it.
     clear_session_tokens(request)
     request.session.clear()
     return {"status": "ok", "message": "Logged out"}
@@ -1437,7 +1438,7 @@ async def extract_sow(
         ctx = _load_user_context(user_id)
         if not _sharepoint_context_configured(ctx):
             raise HTTPException(status_code=400, detail="SharePoint context not set. Call /sharepoint/context first.")
-        sid = request.session.get("sid")
+        snapshot = snapshot_session_tokens(request)
         loop = asyncio.get_event_loop()
         new_count, total_count, output_path = await loop.run_in_executor(
             None,
@@ -1447,7 +1448,7 @@ async def extract_sow(
                 user_id=user_id,
                 access_token=access_token,
                 user_context=ctx,
-                token_provider=(lambda: get_access_token_for_session(sid)) if sid else None,
+                token_provider=(lambda: get_access_token_from_snapshot(snapshot)) if snapshot else None,
             ),
         )
     except Exception as e:
@@ -1496,7 +1497,7 @@ async def extract_sow_start(request: Request, user: dict = Depends(get_current_u
             "access_token": access_token,
             "user_context": ctx,
             "force_reprocess": False,
-            "session_id": request.session.get("sid"),
+            "token_snapshot": snapshot_session_tokens(request),
         },
         daemon=True,
     )
@@ -1594,7 +1595,7 @@ async def extract_sow_reprocess_all(request: Request, user: dict = Depends(get_c
             "access_token": access_token,
             "user_context": ctx,
             "force_reprocess": True,
-            "session_id": request.session.get("sid"),
+            "token_snapshot": snapshot_session_tokens(request),
         },
         daemon=True,
     )
