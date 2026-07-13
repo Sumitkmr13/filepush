@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import threading
+import time
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
@@ -48,6 +49,7 @@ from config import (
     EXCEL_OUTPUT_DIR,
     EXCEL_SOW_PATH,
     EXCEL_INVOICE_PATH,
+    EXTRACTION_MAX_RUN_MINUTES,
     EXTRACTION_MONITOR_INTERVAL_MINUTES,
     EXTRACTION_STATE_PATH,
     FIELDS,
@@ -105,15 +107,7 @@ from user_storage import user_blob_prefix, user_paths
 # can be re-applied when the Excel is reloaded on subsequent runs.
 _URL_KEY = "SharePoint URL"
 
-# force=True: several imported libraries (Google/Vertex SDKs) install their own root
-# handler on import, which turns a plain basicConfig() into a silent no-op and drops
-# all INFO logs (login, extraction progress, per-file lines). force=True replaces any
-# such handler so app logs always reach stdout/stderr (and Cloud Logging on Cloud Run).
-logging.basicConfig(
-    level=(os.environ.get("LOG_LEVEL") or "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    force=True,
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -935,10 +929,27 @@ def _run_extraction_background(
     snapshot is independent of the session store.
     """
     ustate = _get_user_state(user_id)
+    job_started = time.time()
+    max_run_seconds = EXTRACTION_MAX_RUN_MINUTES * 60 if EXTRACTION_MAX_RUN_MINUTES > 0 else 0
 
     def stop_check() -> bool:
         with _extraction_lock:
-            return ustate["stop_requested"]
+            if ustate["stop_requested"]:
+                return True
+        if max_run_seconds > 0 and (time.time() - job_started) >= max_run_seconds:
+            with _extraction_lock:
+                if not ustate["stop_requested"]:
+                    logger.info(
+                        "Extraction auto-stop: max run time reached (%s minutes).",
+                        EXTRACTION_MAX_RUN_MINUTES,
+                    )
+                    ustate["stop_requested"] = True
+                    ustate["last_error"] = (
+                        f"Stopped automatically after {EXTRACTION_MAX_RUN_MINUTES} minutes. "
+                        "Progress was saved. Click Start to resume (already-processed files are skipped)."
+                    )
+            return True
+        return False
 
     token_provider: Optional[Callable[[], str]] = None
     if token_snapshot:
@@ -994,11 +1005,6 @@ async def auth_callback(request: Request, code: Optional[str] = None, state: Opt
     }
     save_session_tokens(request, token_result)
     request.session.pop("oauth_state", None)
-    logger.info(
-        "User logged in: %s (%s)",
-        claims.get("preferred_username") or "unknown",
-        claims.get("name") or "",
-    )
     return RedirectResponse(url="/")
 
 
@@ -1010,8 +1016,6 @@ async def auth_logout(request: Request):
     # - run status: a background job may still be running (it holds its own token
     #   snapshot), and after re-login the same user must see its progress and be
     #   able to stop it.
-    user = request.session.get("user") or {}
-    logger.info("User logged out: %s", user.get("preferred_username") or user.get("name") or "unknown")
     clear_session_tokens(request)
     request.session.clear()
     return {"status": "ok", "message": "Logged out"}
