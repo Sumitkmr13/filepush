@@ -1835,6 +1835,11 @@ async def download_file(file_name: str, user: dict = Depends(get_current_user)):
         path,
         filename=path.name,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
     )
 
 
@@ -1911,7 +1916,12 @@ async def download_filtered_file(
     return Response(
         content=output.getvalue(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{out_name}"',
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
     )
 
 
@@ -2159,8 +2169,8 @@ async def read_index(request: Request):
       <div class="rounded-xl bg-white border border-slate-200 p-4 shadow-sm">
         <h2 class="text-lg font-semibold mb-3">Download Center</h2>
         <div class="space-y-2">
-          <a class="block w-full text-center px-3 py-2 rounded-md bg-slate-900 text-white hover:bg-slate-700" href="/download/license_metrics.xlsx">Download license_metrics.xlsx</a>
-          <a class="block w-full text-center px-3 py-2 rounded-md bg-slate-900 text-white hover:bg-slate-700" href="/download/contract_metrics.xlsx">Download contract_metrics.xlsx</a>
+          <a class="block w-full text-center px-3 py-2 rounded-md bg-slate-900 text-white hover:bg-slate-700" href="/download/license_metrics.xlsx" onclick="return downloadExcel(event, this.href)">Download license_metrics.xlsx</a>
+          <a class="block w-full text-center px-3 py-2 rounded-md bg-slate-900 text-white hover:bg-slate-700" href="/download/contract_metrics.xlsx" onclick="return downloadExcel(event, this.href)">Download contract_metrics.xlsx</a>
         </div>
         <div class="mt-4 border-t pt-3">
           <div class="text-sm font-medium mb-2">Filtered Download (Date Range)</div>
@@ -2467,6 +2477,13 @@ async def read_index(request: Request):
       }
     }
 
+    function downloadExcel(event, href) {
+      event.preventDefault();
+      const sep = href.includes("?") ? "&" : "?";
+      window.location.href = href + sep + "t=" + Date.now();
+      return false;
+    }
+
     async function refreshDownloads() {
       try {
         const data = await apiCall("/download");
@@ -2485,7 +2502,8 @@ async def read_index(request: Request):
       const params = new URLSearchParams();
       if (start) params.set("start_date", start);
       if (end) params.set("end_date", end);
-      const url = buildUrl(`/download/filtered/${encodeURIComponent(file)}${params.toString() ? "?" + params.toString() : ""}`);
+      params.set("t", String(Date.now()));
+      const url = buildUrl(`/download/filtered/${encodeURIComponent(file)}?${params.toString()}`);
       window.location.href = url;
     }
 
