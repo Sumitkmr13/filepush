@@ -623,6 +623,22 @@ def _upload_state_to_gcs(
         logger.warning("Failed to upload extraction state to GCS: %s", e)
 
 
+def _ensure_user_persistent_data(user_id: str) -> None:
+    """Pull this user's Excel + extraction_state from GCS when configured.
+
+    Call before downloads / state so a local app sees the same files Cloud Run uploaded,
+    without requiring an extraction start. No-op when GCS_OUTPUT_BUCKET is unset.
+    """
+    ups = user_paths(user_id)
+    ups["base_dir"].mkdir(parents=True, exist_ok=True)
+    _sync_persistent_data_from_gcs(
+        state_path=ups["state_path"],
+        excel_sow_path=ups["excel_sow_path"],
+        excel_invoice_path=ups["excel_invoice_path"],
+        blob_prefix=user_blob_prefix(user_id),
+    )
+
+
 def _route_doc_type(doc_type_raw: str) -> str:
     """Return 'invoice' or 'sow' from a raw Document Type string extracted by the LLM."""
     v = doc_type_raw.strip().lower()
@@ -1804,6 +1820,7 @@ async def extract_sow_scan(request: Request, timeout: int = 300, user: dict = De
 async def download_file(file_name: str, user: dict = Depends(get_current_user)):
     """Serve a generated Excel from DATA_DIR by exact filename (e.g. sow_results.xlsx or invoice_results.xlsx)."""
     user_id = _user_id_from_claims(user)
+    _ensure_user_persistent_data(user_id)
     ups = user_paths(user_id)
     allowed = {
         ups["excel_sow_path"].name: ups["excel_sow_path"],
@@ -1833,6 +1850,7 @@ async def download_filtered_file(
     Filters on Start Date (>= start_date) and End Date (<= end_date) when provided.
     """
     user_id = _user_id_from_claims(user)
+    _ensure_user_persistent_data(user_id)
     ups = user_paths(user_id)
     allowed = {
         ups["excel_sow_path"].name: ups["excel_sow_path"],
@@ -1902,6 +1920,7 @@ async def download_list(user: dict = Depends(get_current_user)):
     """List available output Excels with download links."""
     files = []
     user_id = _user_id_from_claims(user)
+    _ensure_user_persistent_data(user_id)
     ups = user_paths(user_id)
     for p in [ups["excel_sow_path"], ups["excel_invoice_path"]]:
         if p.exists():
@@ -1916,6 +1935,7 @@ async def get_state(user: dict = Depends(get_current_user)):
     """Return current extraction state (processed count / path) for debugging."""
     from state_manager import get_state_summary
     user_id = _user_id_from_claims(user)
+    _ensure_user_persistent_data(user_id)
     spath = user_paths(user_id)["state_path"]
     summary = get_state_summary(state_path=spath)
     summary["state_path"] = str(spath)
@@ -1930,6 +1950,7 @@ async def get_state_by_type(doc_type: str = "sow", user: dict = Depends(get_curr
     """
     from state_manager import get_processed_items_by_type
     user_id = _user_id_from_claims(user)
+    _ensure_user_persistent_data(user_id)
     spath = user_paths(user_id)["state_path"]
     items = get_processed_items_by_type(doc_type, state_path=spath)
     return {"doc_type": doc_type, "count": len(items), "items": items}
