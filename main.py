@@ -2135,9 +2135,6 @@ async def read_index(request: Request):
           <button id="toggleBtn" onclick="toggleStartStop()" class="px-4 py-2 rounded-md text-white bg-emerald-600 hover:bg-emerald-700">
             Start Extraction
           </button>
-          <button onclick="processNow()" class="px-4 py-2 rounded-md text-white bg-indigo-600 hover:bg-indigo-700">
-            Process New Files Now
-          </button>
           <label class="inline-flex items-center gap-2 text-sm text-slate-700">
             <input id="forceReprocess" type="checkbox" class="rounded border-slate-300" />
             Force reprocess
@@ -2508,10 +2505,15 @@ async def read_index(request: Request):
     }
 
     async function startJob() {
+      const force = document.getElementById("forceReprocess").checked;
       try {
         startAutoPolling();
-        const data = await apiCall("/extract-sow/start", "POST");
-        showToast(data.message || "Started extraction", "ok");
+        const path = force ? "/extract-sow/reprocess-all" : "/extract-sow/start";
+        const data = await apiCall(path, "POST");
+        showToast(
+          data.message || (force ? "Reprocess-all started" : "Started extraction"),
+          "ok",
+        );
         await refreshStatus();
       } catch (err) {
         stopAutoPolling();
@@ -2528,18 +2530,6 @@ async def read_index(request: Request):
         setTimeout(refreshDownloads, 1500);
       } catch (err) {
         showToast("Stop failed: " + err.message, "error");
-      }
-    }
-
-    async function processNow() {
-      const force = document.getElementById("forceReprocess").checked;
-      try {
-        const path = force ? "/extract-sow/?force_reprocess=true" : "/extract-sow/";
-        const data = await apiCall(path, "POST");
-        showToast((data && data.message) || "Manual processing complete", "ok");
-        await refreshAll();
-      } catch (err) {
-        showToast("Manual trigger failed: " + err.message, "error");
       }
     }
 
